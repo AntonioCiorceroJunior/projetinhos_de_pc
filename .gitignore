@@ -1,0 +1,8 @@
+*.exe
+*.dll
+*.pdb
+*.log
+probe_test.txt
+.DS_Store
+Thumbs.db
+.vscode/
