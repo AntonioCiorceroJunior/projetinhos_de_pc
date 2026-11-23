@@ -2150,6 +2150,7 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
 
   var running = false;
   var ws = null;
+  var netWorker = null;
   var ctx = null;
   var gainNode = null;
   var silentInGain = null;
@@ -2157,6 +2158,7 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
   var workletLoaded = false;
   var workletLoading = false;
   var useWorklet = false;
+  var workerPipelineActive = false;
   var engineLabel = 'Ring';
   var dspFallback = null;
   var pendingFrames = [];
@@ -2167,6 +2169,9 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
   var wasAudioRunning = false;
   var keepAlivePlaying = false;
   var intentionalPause = false;
+  var latestWsGapMax = 0;
+  var latestRttMs = 0;
+  var lastStatSendTime = 0;
 
   var sampleRate = 48000;
   var targetBufferMs = initialMode === 'usb' ? 15 : 60;
@@ -2181,6 +2186,7 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
     var srcRate = 48000;
     var targetMs = 15;
     var maxMs = 55;
+    var pktFrames = 480;
     var writePos = 0;
     var readPos = 0;
     var primed = false;
@@ -2192,14 +2198,22 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
     var plcAnchor = 0;
     var plcStep = 1;
     var plcGain = 1.0;
+    var fadeLen = 48;
     var fadeRem = 0;
-    var fadeTotal = 48;
     var prevOutL = 0;
     var prevOutR = 0;
     var resyncCount = 0;
     var plcEvents = 0;
+    var plcDelta = 0;
+    var minAvailFrames = 999999;
     var smoothLevel = 0;
     var lastBufMs = 0;
+    var lastMinBufMs = 0;
+
+    function startFade(len) {
+      fadeLen = len > 0 ? len : 1;
+      fadeRem = fadeLen;
+    }
 
     function reset() {
       writePos = 0;
@@ -2212,11 +2226,15 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
       plcFrames = 0;
       plcStep = 1;
       plcGain = 1.0;
+      fadeLen = 48;
       fadeRem = 0;
       prevOutL = 0;
       prevOutR = 0;
+      plcDelta = 0;
+      minAvailFrames = 999999;
       smoothLevel = 0;
       lastBufMs = 0;
+      lastMinBufMs = 0;
     }
 
     function setConfig(sr, tMs, mMs) {
@@ -2237,6 +2255,7 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
       if (!ab || ab.byteLength <= 8) return;
       var frames = ((ab.byteLength - 8) / 4) | 0;
       if (frames <= 0) return;
+      pktFrames = frames;
       var i16 = new Int16Array(ab, 8, frames * 2);
       var peak = 0;
       var w = writePos;
@@ -2253,21 +2272,23 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
       writePos = w;
       smoothLevel = smoothLevel * 0.65 + Math.min(1, peak * 1.4) * 0.35;
 
-      var targetFrames = Math.max(128, Math.round((targetMs * srcRate) / 1000));
+      var targetFrames = Math.max(96, Math.round((targetMs * srcRate) / 1000));
+      var primeFrames = targetFrames + (pktFrames >> 1);
       if (!primed) {
-        if ((writePos - Math.floor(readPos)) >= targetFrames) {
+        if ((writePos - Math.floor(readPos)) >= primeFrames) {
           primed = true;
-          readPos = writePos - targetFrames;
+          readPos = writePos - primeFrames;
           avgAvail = targetFrames;
+          minAvailFrames = targetFrames;
           integral = 0;
           smoothedRate = srcRate / (outRate || 48000);
-          fadeRem = fadeTotal;
+          startFade(48);
           prevOutL = 0;
           prevOutR = 0;
         }
       } else if ((writePos - readPos) > (CAP - 1024)) {
-        readPos = writePos - targetFrames;
-        fadeRem = fadeTotal;
+        readPos = writePos - primeFrames;
+        startFade(48);
         avgAvail = targetFrames;
         integral = 0;
         resyncCount++;
@@ -2305,11 +2326,11 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
       }
 
       var targetFrames = Math.max(96, (targetMs * srcRate) / 1000);
-      var maxFrames = Math.max((maxMs * srcRate) / 1000, targetFrames + (srcRate * 0.025));
+      var maxFrames = Math.max((maxMs * srcRate) / 1000, targetFrames + Math.round(srcRate * 0.030));
       var availNow = writePos - readPos;
       if (availNow > maxFrames) {
-        readPos = writePos - targetFrames;
-        fadeRem = fadeTotal;
+        readPos = writePos - (targetFrames + (pktFrames >> 1));
+        startFade(48);
         avgAvail = targetFrames;
         integral = 0;
         resyncCount++;
@@ -2317,6 +2338,7 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
       }
 
       var avail = Math.max(0, availNow);
+      if (avail < minAvailFrames) minAvailFrames = avail;
       avgAvail = avgAvail * 0.94 + avail * 0.06;
       var dt = n / (outRate || 48000);
       var errSec = (avgAvail - targetFrames) / srcRate;
@@ -2335,11 +2357,13 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
       var maxPlcResetFrames = Math.round(srcRate * 0.045);
 
       for (var i = 0; i < n; i++) {
+        var curAvail = writePos - readPos;
+        if (curAvail < minAvailFrames) minAvailFrames = Math.max(0, curAvail);
         if (readPos + 1.0 < writePos) {
           if (plcMode) {
             plcMode = false;
             plcFrames = 0;
-            fadeRem = 32;
+            startFade(32);
           }
           var idx = Math.floor(readPos);
           var frac = readPos - idx;
@@ -2355,9 +2379,8 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
             sR = ringR[i0] + (ringR[i1] - ringR[i0]) * frac;
           }
           if (fadeRem > 0) {
-            var w = (fadeTotal - fadeRem) / fadeTotal;
-            if (w < 0) w = 0;
-            if (w > 1) w = 1;
+            var t = (fadeLen - fadeRem) / fadeLen;
+            var w = 0.5 - 0.5 * Math.cos(Math.PI * t);
             sL = prevOutL * (1.0 - w) + sL * w;
             sR = prevOutR * (1.0 - w) + sR * w;
             fadeRem--;
@@ -2368,6 +2391,7 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
           prevOutR = sR;
           readPos += smoothedRate;
         } else {
+          minAvailFrames = 0;
           if (!plcMode) {
             plcMode = true;
             plcFrames = 0;
@@ -2375,6 +2399,7 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
             plcStep = 1;
             plcGain = 1.0;
             plcEvents++;
+            plcDelta++;
           }
           plcFrames++;
           if (plcFrames > maxPlcResetFrames) {
@@ -2410,13 +2435,23 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
       }
 
       lastBufMs = Math.max(0, Math.round(((writePos - readPos) * 1000) / srcRate));
+      if (minAvailFrames < 999999) {
+        lastMinBufMs = Math.max(0, Math.round((minAvailFrames * 1000) / srcRate));
+      } else {
+        lastMinBufMs = lastBufMs;
+      }
     }
 
     function getTelemetry() {
+      var curDelta = plcDelta;
+      plcDelta = 0;
+      minAvailFrames = Math.max(0, writePos - readPos);
       return {
         bufMs: lastBufMs,
+        minBufMs: lastMinBufMs,
         resyncs: resyncCount,
         plc: plcEvents,
+        plcDelta: curDelta,
         level: smoothLevel
       };
     }
@@ -2489,23 +2524,57 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
     fmtStat.textContent = (Math.round(sampleRate / 100) / 10) + 'kHz · ' + engineLabel;
   }
 
+  function sendStatsToPc(t) {
+    if (!running || !t) return;
+    var now = performance.now();
+    var elapsed = lastStatSendTime > 0 ? (now - lastStatSendTime) : 400;
+    lastStatSendTime = now;
+    var plcPerSec = Math.round(((t.plcDelta || 0) * 1000) / Math.max(120, elapsed));
+    var payload = JSON.stringify({
+      type: 'stats',
+      engine: engineLabel,
+      bufMs: t.bufMs,
+      minBufMs: t.minBufMs,
+      wsGapMaxMs: latestWsGapMax,
+      plc: t.plc,
+      plcPerSec: plcPerSec,
+      resyncs: t.resyncs,
+      rttMs: latestRttMs,
+      targetMs: targetBufferMs
+    });
+    if (netWorker) {
+      try { netWorker.postMessage({ type: 'sendText', text: payload }); } catch (e) {}
+    } else if (ws && ws.readyState === 1) {
+      try { ws.send(payload); } catch (e) {}
+    }
+  }
+
   function applyTelemetry(t) {
     if (!t) return;
     bufStat.textContent = t.bufMs + ' ms';
     dropStat.textContent = String(t.resyncs) + (t.plc > 0 ? ' (PLC ' + t.plc + ')' : '');
     meterFill.style.width = Math.round(Math.min(1, t.level) * 100) + '%';
+    sendStatsToPc(t);
   }
 
   function disconnectSession(state, title, sub) {
-    if (!running && !ws) {
+    if (!running && !ws && !netWorker) {
       setStatus(state, title, sub);
       return;
     }
     running = false;
     wasAudioRunning = false;
+    workerPipelineActive = false;
     pendingFrames = [];
+    latestWsGapMax = 0;
+    lastStatSendTime = 0;
     if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
     if (telemetryTimer) { clearInterval(telemetryTimer); telemetryTimer = null; }
+    if (netWorker) {
+      try { netWorker.postMessage({ type: 'close' }); } catch (e) {}
+      try { netWorker.terminate(); } catch (e) {}
+      netWorker = null;
+    }
     if (ws) {
       try {
         ws.onopen = null;
@@ -2618,7 +2687,7 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
       if (running && !useWorklet && dspFallback) {
         applyTelemetry(dspFallback.getTelemetry());
       }
-    }, 110);
+    }, 400);
   }
 
   function flushPendingFrames() {
@@ -2647,11 +2716,18 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
       '    this.dsp = createRingDspEngine(sampleRate);\n' +
       '    this.active = false;\n' +
       '    this.tick = 0;\n' +
+      '    this.netPort = null;\n' +
       '    var self = this;\n' +
       '    this.port.onmessage = function(ev) {\n' +
       '      var d = ev.data;\n' +
       '      if (d instanceof ArrayBuffer) {\n' +
       '        if (self.active) self.dsp.pushInt16Bytes(d);\n' +
+      '      } else if (d && d.type === \'netPort\' && d.port) {\n' +
+      '        if (self.netPort) { try { self.netPort.onmessage = null; self.netPort.close(); } catch (e) {} }\n' +
+      '        self.netPort = d.port;\n' +
+      '        self.netPort.onmessage = function(nev) {\n' +
+      '          if (self.active && nev.data instanceof ArrayBuffer) self.dsp.pushInt16Bytes(nev.data);\n' +
+      '        };\n' +
       '      } else if (d && d.type === \'cfg\') {\n' +
       '        self.dsp.setConfig(d.sampleRate, d.targetMs, d.maxMs);\n' +
       '      } else if (d && d.type === \'buf\') {\n' +
@@ -2676,7 +2752,7 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
       '      return true;\n' +
       '    }\n' +
       '    this.dsp.renderBlock(outL, outR || outL);\n' +
-      '    if (++this.tick >= 36) {\n' +
+      '    if (++this.tick >= 150) {\n' +
       '      this.tick = 0;\n' +
       '      this.port.postMessage(this.dsp.getTelemetry());\n' +
       '    }\n' +
@@ -2686,7 +2762,129 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
       'registerProcessor(\'phone-audio-bridge-proc\', PhoneAudioBridgeWorklet);\n';
   }
 
-  function ensureAudioContextAndEngine() {
+  function buildNetWorkerCode() {
+    return 'var ws = null;\n' +
+      'var audioPort = null;\n' +
+      'var pingTimer = null;\n' +
+      'var gapTimer = null;\n' +
+      'var lastBinMs = 0;\n' +
+      'var maxGapMs = 0;\n' +
+      'self.onmessage = function(ev) {\n' +
+      '  var d = ev.data;\n' +
+      '  if (!d) return;\n' +
+      '  if (d.type === \'init\') {\n' +
+      '    audioPort = d.audioPort;\n' +
+      '    ws = new WebSocket(d.wsUrl);\n' +
+      '    ws.binaryType = \'arraybuffer\';\n' +
+      '    ws.onopen = function() {\n' +
+      '      self.postMessage({ type: \'open\' });\n' +
+      '      pingTimer = setInterval(function() {\n' +
+      '        if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: \'ping\', t: performance.now() }));\n' +
+      '      }, 2000);\n' +
+      '      gapTimer = setInterval(function() {\n' +
+      '        self.postMessage({ type: \'wsGap\', maxGapMs: maxGapMs });\n' +
+      '        maxGapMs = 0;\n' +
+      '      }, 400);\n' +
+      '      ws.send(JSON.stringify({ type: \'ping\', t: performance.now() }));\n' +
+      '    };\n' +
+      '    ws.onmessage = function(wev) {\n' +
+      '      if (typeof wev.data === \'string\') {\n' +
+      '        try {\n' +
+      '          var msg = JSON.parse(wev.data);\n' +
+      '          if (msg.type === \'pong\' && typeof msg.t === \'number\') {\n' +
+      '            self.postMessage({ type: \'rtt\', ms: Math.max(1, Math.round(performance.now() - msg.t)) });\n' +
+      '          } else if (msg.type === \'config\') {\n' +
+      '            self.postMessage({ type: \'config\', msg: msg });\n' +
+      '          }\n' +
+      '        } catch (e) {}\n' +
+      '      } else if (wev.data instanceof ArrayBuffer) {\n' +
+      '        var now = performance.now();\n' +
+      '        if (lastBinMs > 0) {\n' +
+      '          var dt = Math.round(now - lastBinMs);\n' +
+      '          if (dt > maxGapMs) maxGapMs = dt;\n' +
+      '        }\n' +
+      '        lastBinMs = now;\n' +
+      '        if (audioPort) audioPort.postMessage(wev.data, [wev.data]);\n' +
+      '      }\n' +
+      '    };\n' +
+      '    ws.onclose = function() {\n' +
+      '      if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }\n' +
+      '      if (gapTimer) { clearInterval(gapTimer); gapTimer = null; }\n' +
+      '      self.postMessage({ type: \'close\' });\n' +
+      '    };\n' +
+      '    ws.onerror = function() {\n' +
+      '      self.postMessage({ type: \'error\' });\n' +
+      '    };\n' +
+      '  } else if (d.type === \'sendText\' && ws && ws.readyState === 1) {\n' +
+      '    ws.send(d.text);\n' +
+      '  } else if (d.type === \'close\') {\n' +
+      '    if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }\n' +
+      '    if (gapTimer) { clearInterval(gapTimer); gapTimer = null; }\n' +
+      '    if (ws) { try { ws.onclose = null; ws.onerror = null; ws.close(); } catch (e) {} ws = null; }\n' +
+      '    if (audioPort) { try { audioPort.close(); } catch (e) {} audioPort = null; }\n' +
+      '  }\n' +
+      '};\n';
+  }
+
+  function handleConfigFromServer(msg) {
+    if (!msg) return;
+    if (msg.sampleRate) sampleRate = msg.sampleRate;
+    updateFormatLabel();
+    if (msg.device) deviceText.textContent = 'Fonte PC: ' + msg.device;
+    var tr = msg.transport || msg.mode;
+    if (tr) applyModeBadge(tr);
+    if (autoFollowPc && msg.targetBufferMs) {
+      updateBufferUi(msg.targetBufferMs, msg.maxBufferMs);
+    }
+    if (useWorklet && workletLoaded && audioNode && audioNode.port) {
+      audioNode.port.postMessage({ type: 'cfg', sampleRate: sampleRate, targetMs: targetBufferMs, maxMs: maxBufferMs });
+    } else if (dspFallback) {
+      dspFallback.setConfig(sampleRate, targetBufferMs, maxBufferMs);
+    }
+  }
+
+  function startWorkerWebSocket() {
+    if (!running) return;
+    if (netWorker) {
+      try { netWorker.terminate(); } catch (e) {}
+      netWorker = null;
+    }
+    var proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+    var wsUrl = proto + location.host + '/ws';
+    setStatus('wait', 'Conectando ao PC...', 'Abrindo canal Worker + Worklet');
+    var ch = new MessageChannel();
+    audioNode.port.postMessage({ type: 'netPort', port: ch.port1 }, [ch.port1]);
+
+    var wUrl = URL.createObjectURL(new Blob([buildNetWorkerCode()], { type: 'application/javascript' }));
+    netWorker = new Worker(wUrl);
+    URL.revokeObjectURL(wUrl);
+    workerPipelineActive = true;
+    engineLabel = 'Worklet+Worker';
+    updateFormatLabel();
+
+    netWorker.onmessage = function(ev) {
+      var d = ev.data;
+      if (!d || !running) return;
+      if (d.type === 'open') {
+        setStatus('live', 'Conectado e recebendo áudio', 'Áudio pronto — toque algo no PC para ouvir');
+      } else if (d.type === 'rtt') {
+        latestRttMs = d.ms;
+        rttStat.textContent = d.ms + ' ms';
+      } else if (d.type === 'wsGap') {
+        latestWsGapMax = d.maxGapMs;
+      } else if (d.type === 'config') {
+        handleConfigFromServer(d.msg);
+      } else if (d.type === 'close') {
+        disconnectSession('', 'Conexão com o PC encerrada', 'Não reconecta sozinho. Toque acima quando quiser conectar novamente');
+      } else if (d.type === 'error') {
+        disconnectSession('err', 'Falha na conexão', 'Verifique se o app está aberto e o firewall liberado');
+      }
+    };
+
+    netWorker.postMessage({ type: 'init', wsUrl: wsUrl, audioPort: ch.port2 }, [ch.port2]);
+  }
+
+  function startSessionPipeline() {
     var AC = window.AudioContext || window.webkitAudioContext;
     if (!ctx) {
       try {
@@ -2719,18 +2917,27 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
       } catch (e) {}
     }
 
-    if (window.isSecureContext && ctx.audioWorklet) {
+    var canWorklet = !!(window.isSecureContext && ctx.audioWorklet);
+    var canWorker = !!(canWorklet && window.Worker && window.MessageChannel);
+
+    if (canWorklet) {
       if (workletLoaded && audioNode) {
         useWorklet = true;
+        engineLabel = canWorker ? 'Worklet+Worker' : 'Worklet 2.7ms';
+        updateFormatLabel();
         audioNode.port.postMessage({ type: 'cfg', sampleRate: sampleRate, targetMs: targetBufferMs, maxMs: maxBufferMs });
         audioNode.port.postMessage({ type: 'start' });
-        flushPendingFrames();
+        if (canWorker) {
+          startWorkerWebSocket();
+        } else {
+          connectWsMainThread();
+        }
         return;
       }
       if (!workletLoading) {
         workletLoading = true;
         useWorklet = true;
-        engineLabel = 'Worklet 2.7ms';
+        engineLabel = canWorker ? 'Worklet+Worker' : 'Worklet 2.7ms';
         updateFormatLabel();
         var blobUrl = URL.createObjectURL(new Blob([buildWorkletCode()], { type: 'application/javascript' }));
         ctx.audioWorklet.addModule(blobUrl).then(function() {
@@ -2745,28 +2952,38 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
           audioNode.port.postMessage({ type: 'cfg', sampleRate: sampleRate, targetMs: targetBufferMs, maxMs: maxBufferMs });
           if (running) {
             audioNode.port.postMessage({ type: 'start' });
-            flushPendingFrames();
+            if (canWorker) {
+              startWorkerWebSocket();
+            } else {
+              flushPendingFrames();
+            }
           }
         }).catch(function() {
           URL.revokeObjectURL(blobUrl);
           workletLoading = false;
           useWorklet = false;
           initScriptProcessorEngine();
+          if (running && !ws) connectWsMainThread();
         });
+        if (!canWorker) {
+          connectWsMainThread();
+        }
       }
     } else {
       initScriptProcessorEngine();
+      connectWsMainThread();
     }
   }
 
-  function connectWs() {
-    if (!running) return;
+  function connectWsMainThread() {
+    if (!running || workerPipelineActive) return;
     if (ws) {
       try { ws.close(); } catch (e) {}
       ws = null;
     }
 
     var proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+    var lastBinMs = 0;
     setStatus('wait', 'Conectando ao PC...', 'Abrindo canal de baixa latência');
     ws = new WebSocket(proto + location.host + '/ws');
     ws.binaryType = 'arraybuffer';
@@ -2787,24 +3004,19 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
         try {
           var msg = JSON.parse(ev.data);
           if (msg.type === 'pong' && typeof msg.t === 'number') {
-            rttStat.textContent = Math.max(1, Math.round(performance.now() - msg.t)) + ' ms';
+            latestRttMs = Math.max(1, Math.round(performance.now() - msg.t));
+            rttStat.textContent = latestRttMs + ' ms';
           } else if (msg.type === 'config') {
-            if (msg.sampleRate) sampleRate = msg.sampleRate;
-            updateFormatLabel();
-            if (msg.device) deviceText.textContent = 'Fonte PC: ' + msg.device;
-            var tr = msg.transport || msg.mode;
-            if (tr) applyModeBadge(tr);
-            if (autoFollowPc && msg.targetBufferMs) {
-              updateBufferUi(msg.targetBufferMs, msg.maxBufferMs);
-            }
-            if (useWorklet && workletLoaded && audioNode && audioNode.port) {
-              audioNode.port.postMessage({ type: 'cfg', sampleRate: sampleRate, targetMs: targetBufferMs, maxMs: maxBufferMs });
-            } else if (dspFallback) {
-              dspFallback.setConfig(sampleRate, targetBufferMs, maxBufferMs);
-            }
+            handleConfigFromServer(msg);
           }
         } catch (e) {}
       } else if (ev.data instanceof ArrayBuffer) {
+        var now = performance.now();
+        if (lastBinMs > 0) {
+          var dt = Math.round(now - lastBinMs);
+          if (dt > latestWsGapMax) latestWsGapMax = dt;
+        }
+        lastBinMs = now;
         dispatchAudioFrame(ev.data);
       }
     };
@@ -2826,12 +3038,13 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
     if (!running) {
       running = true;
       pendingFrames = [];
+      latestWsGapMax = 0;
+      lastStatSendTime = 0;
       dropStat.textContent = '0';
       playBtn.textContent = 'Desconectar';
       playBtn.className = 'btn-main stop';
-      ensureAudioContextAndEngine();
       startKeepAlive();
-      connectWs();
+      startSessionPipeline();
     } else {
       disconnectSession('', 'Desconectado', 'Toque acima para conectar novamente');
     }
@@ -2914,6 +3127,8 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
 
         public readonly string LocalIp;
         public readonly bool IsUsbTransport;
+        public volatile string LatestStatsJson = "";
+        public int LatestStatsTick;
 
         public WsClientSession(TcpClient tcp, NetworkStream stream, string localIp, bool isUsbTransport, int maxQueueSize, Action<WsClientSession> onDisconnect)
         {
@@ -3126,6 +3341,11 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
                         {
                             string pong = msg.Replace("\"ping\"", "\"pong\"");
                             EnqueueText(pong);
+                        }
+                        else if (msg.Contains("\"stats\""))
+                        {
+                            LatestStatsJson = msg;
+                            LatestStatsTick = Environment.TickCount;
                         }
                     }
                 }
@@ -3389,6 +3609,80 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
                 EscapeJson(DeviceName));
         }
 
+        public string GetLiveClientStatsSummary(out bool hasGlitches)
+        {
+            hasGlitches = false;
+            string latestJson = "";
+            int clientTotal = 0;
+            lock (_clientsLock)
+            {
+                clientTotal = _clients.Count;
+                for (int i = 0; i < _clients.Count; i++)
+                {
+                    if (!string.IsNullOrEmpty(_clients[i].LatestStatsJson))
+                    {
+                        latestJson = _clients[i].LatestStatsJson;
+                        break;
+                    }
+                }
+            }
+
+            if (clientTotal == 0)
+            {
+                return "Telemetria ao vivo: aguardando conexão do celular...";
+            }
+            if (string.IsNullOrEmpty(latestJson))
+            {
+                return "Telemetria ao vivo: conectado (aguardando métricas do player...)";
+            }
+
+            string engine = ExtractJsonStr(latestJson, "engine");
+            int bufMs = ExtractJsonInt(latestJson, "bufMs");
+            int minBufMs = ExtractJsonInt(latestJson, "minBufMs");
+            int gapMs = ExtractJsonInt(latestJson, "wsGapMaxMs");
+            int plcPerSec = ExtractJsonInt(latestJson, "plcPerSec");
+            int resyncs = ExtractJsonInt(latestJson, "resyncs");
+            int rttMs = ExtractJsonInt(latestJson, "rttMs");
+            if (plcPerSec > 0) hasGlitches = true;
+
+            return string.Format(
+                "{0} | Buf {1}ms (mín {2}ms) | Gap {3}ms | Cortes/s: {4} | Resync: {5} | Ping {6}ms",
+                string.IsNullOrEmpty(engine) ? "Player" : engine,
+                bufMs,
+                minBufMs,
+                gapMs,
+                plcPerSec,
+                resyncs,
+                rttMs);
+        }
+
+        private static string ExtractJsonStr(string json, string key)
+        {
+            string pat = "\"" + key + "\":\"";
+            int idx = json.IndexOf(pat, StringComparison.Ordinal);
+            if (idx < 0) return "";
+            int start = idx + pat.Length;
+            int end = json.IndexOf('"', start);
+            if (end <= start) return "";
+            return json.Substring(start, end - start);
+        }
+
+        private static int ExtractJsonInt(string json, string key)
+        {
+            string pat = "\"" + key + "\":";
+            int idx = json.IndexOf(pat, StringComparison.Ordinal);
+            if (idx < 0) return 0;
+            int i = idx + pat.Length;
+            while (i < json.Length && json[i] == ' ') i++;
+            int start = i;
+            if (i < json.Length && json[i] == '-') i++;
+            while (i < json.Length && char.IsDigit(json[i])) i++;
+            if (i <= start) return 0;
+            int val;
+            if (int.TryParse(json.Substring(start, i - start), out val)) return val;
+            return 0;
+        }
+
         private string BuildInfoJson()
         {
             var usbListSb = new StringBuilder();
@@ -3402,8 +3696,25 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
                     first = false;
                 }
             }
+
+            var statsSb = new StringBuilder();
+            lock (_clientsLock)
+            {
+                bool first = true;
+                for (int i = 0; i < _clients.Count; i++)
+                {
+                    string s = (_clients[i].LatestStatsJson ?? "").Trim();
+                    if (s.StartsWith("{", StringComparison.Ordinal) && s.EndsWith("}", StringComparison.Ordinal))
+                    {
+                        if (!first) statsSb.Append(",");
+                        statsSb.Append(s);
+                        first = false;
+                    }
+                }
+            }
+
             return string.Format(
-                "{{\"mode\":\"{0}\",\"sampleRate\":{1},\"channels\":2,\"bits\":16,\"chunkMs\":{2},\"targetBufferMs\":{3},\"maxBufferMs\":{4},\"device\":\"{5}\",\"clients\":{6},\"clientTransports\":\"{7}\",\"usbDetected\":{8},\"adbActive\":{9},\"usbIps\":[{10}]}}",
+                "{{\"mode\":\"{0}\",\"sampleRate\":{1},\"channels\":2,\"bits\":16,\"chunkMs\":{2},\"targetBufferMs\":{3},\"maxBufferMs\":{4},\"device\":\"{5}\",\"clients\":{6},\"clientTransports\":\"{7}\",\"usbDetected\":{8},\"adbActive\":{9},\"usbIps\":[{10}],\"clientStats\":[{11}]}}",
                 Mode,
                 SampleRate,
                 ChunkMs,
@@ -3414,7 +3725,8 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
                 ConnectedTransportSummary,
                 UsbDetected ? "true" : "false",
                 AdbActive ? "true" : "false",
-                usbListSb.ToString());
+                usbListSb.ToString(),
+                statsSb.ToString());
         }
 
         private static string EscapeJson(string s)
@@ -3664,6 +3976,7 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
         private PictureBox _picQr;
         private TextBox _txtUrl;
         private Label _lblQrHint;
+        private Label _lblLiveDiag;
         private System.Windows.Forms.Timer _uiTimer;
 
         public MainBridgeForm(BridgeMode initialMode)
@@ -3723,9 +4036,7 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
         private void BuildUi()
         {
             Text = "Phone Audio Bridge — Áudio do PC no Fone via Celular";
-            ClientSize = new Size(780, 560);
-            MinimumSize = new Size(780, 560);
-            MaximumSize = new Size(780, 560);
+            ClientSize = new Size(780, 594);
             StartPosition = FormStartPosition.CenterScreen;
             BackColor = Color.FromArgb(18, 21, 28);
             ForeColor = Color.FromArgb(241, 245, 249);
@@ -3902,11 +4213,24 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
             _usbGuideCard.Controls.Add(_btnAdbTunnel);
             Controls.Add(_usbGuideCard);
 
+            _lblLiveDiag = new Label
+            {
+                Text = "Telemetria ao vivo: aguardando conexão do celular...",
+                Location = new Point(lx, 492),
+                Size = new Size(lw, 34),
+                BackColor = Color.FromArgb(15, 19, 26),
+                ForeColor = Color.FromArgb(148, 163, 184),
+                Font = new Font("Consolas", 8f),
+                TextAlign = ContentAlignment.MiddleLeft,
+                Padding = new Padding(8, 0, 8, 0)
+            };
+            Controls.Add(_lblLiveDiag);
+
             // Bottom utility buttons
-            _btnFirewall = MakeSmallButton("Liberar Firewall (Admin)", lx, 498, 198, 36);
+            _btnFirewall = MakeSmallButton("Liberar Firewall (Admin)", lx, 536, 198, 36);
             _btnFirewall.Click += OnFirewallClick;
 
-            var btnHideTray = MakeSmallButton("Ocultar na Bandeja (^)", lx + 210, 498, 198, 36);
+            var btnHideTray = MakeSmallButton("Ocultar na Bandeja (^)", lx + 210, 536, 198, 36);
             btnHideTray.Click += delegate { HideToTray(); };
 
             Controls.Add(_btnFirewall);
@@ -3916,7 +4240,7 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
             var qrCard = new Panel
             {
                 Location = new Point(450, 78),
-                Size = new Size(308, 456),
+                Size = new Size(308, 494),
                 BackColor = Color.FromArgb(25, 31, 43)
             };
             var lblQrTitle = new Label
@@ -4284,6 +4608,25 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
                 _vuMeterBar.Width = barW;
             }
 
+            bool hasGlitches;
+            string diagText = _server.GetLiveClientStatsSummary(out hasGlitches);
+            if (!string.Equals(_lblLiveDiag.Text, diagText, StringComparison.Ordinal))
+            {
+                _lblLiveDiag.Text = diagText;
+            }
+            if (clients == 0)
+            {
+                _lblLiveDiag.ForeColor = Color.FromArgb(148, 163, 184);
+            }
+            else if (hasGlitches)
+            {
+                _lblLiveDiag.ForeColor = Color.FromArgb(248, 113, 113);
+            }
+            else
+            {
+                _lblLiveDiag.ForeColor = Color.FromArgb(74, 222, 128);
+            }
+
             _netTickDivider++;
             int netInterval = clients > 0 ? 80 : 25;
             if (_netTickDivider >= netInterval)
@@ -4562,6 +4905,7 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
                 string htmlResp = HttpGetText("127.0.0.1", port, "/?mode=usb");
                 bool htmlValid = htmlResp.Contains("200 OK") &&
                     htmlResp.Contains("AudioWorklet") &&
+                    htmlResp.Contains("buildNetWorkerCode") &&
                     htmlResp.Contains("ringL") &&
                     htmlResp.Contains("disconnectSession") &&
                     !htmlResp.Contains("reconnectTimer") &&
@@ -4569,9 +4913,9 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
 
                 // Test GET /api/info
                 string infoResp = HttpGetText("127.0.0.1", port, "/api/info");
-                bool infoValid = infoResp.Contains("200 OK") && infoResp.Contains("\"mode\":\"usb\"") && infoResp.Contains("\"chunkMs\":10") && infoResp.Contains("\"targetBufferMs\":15");
+                bool infoValid = infoResp.Contains("200 OK") && infoResp.Contains("\"mode\":\"usb\"") && infoResp.Contains("\"chunkMs\":10") && infoResp.Contains("\"targetBufferMs\":15") && infoResp.Contains("\"clientStats\":");
 
-                // Test WebSocket upgrade + config + ping->pong
+                // Test WebSocket upgrade + config + ping->pong + stats->clientStats
                 bool wsValid = TestWebSocketHandshakeAndPing("127.0.0.1", port, out serverDetails);
 
                 serverOk = htmlValid && infoValid && wsValid;
@@ -4669,16 +5013,8 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
 
                     // Send masked ping text frame
                     byte[] pingPayload = Encoding.UTF8.GetBytes("{\"type\":\"ping\",\"t\":123}");
-                    byte[] mask = new byte[] { 0x12, 0x34, 0x56, 0x78 };
-                    byte[] frame = new byte[6 + pingPayload.Length];
-                    frame[0] = 0x81;
-                    frame[1] = (byte)(0x80 | pingPayload.Length);
-                    Buffer.BlockCopy(mask, 0, frame, 2, 4);
-                    for (int i = 0; i < pingPayload.Length; i++)
-                    {
-                        frame[6 + i] = (byte)(pingPayload[i] ^ mask[i & 3]);
-                    }
-                    ns.Write(frame, 0, frame.Length);
+                    byte[] pingFrame = BuildMaskedClientTextFrame(pingPayload);
+                    ns.Write(pingFrame, 0, pingFrame.Length);
 
                     string pongMsg = ReadServerTextFrame(ns);
                     if (!pongMsg.Contains("\"type\":\"pong\""))
@@ -4687,10 +5023,49 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
                         return false;
                     }
 
-                    info = "101+config+pong OK";
+                    // Send masked stats text frame and verify /api/info returns it
+                    byte[] statsPayload = Encoding.UTF8.GetBytes("{\"type\":\"stats\",\"engine\":\"Worklet+Worker\",\"bufMs\":12,\"minBufMs\":6,\"wsGapMaxMs\":11,\"plc\":0,\"plcPerSec\":0,\"resyncs\":0,\"rttMs\":1,\"targetMs\":15}");
+                    byte[] statsFrame = BuildMaskedClientTextFrame(statsPayload);
+                    ns.Write(statsFrame, 0, statsFrame.Length);
+                    ns.Flush();
+                    Thread.Sleep(80);
+
+                    string infoWithStats = HttpGetText(host, port, "/api/info");
+                    if (!infoWithStats.Contains("\"Worklet+Worker\"") || !infoWithStats.Contains("\"wsGapMaxMs\":11"))
+                    {
+                        info = "missing clientStats in /api/info";
+                        return false;
+                    }
+
+                    info = "101+config+pong+stats OK";
                     return true;
                 }
             }
+        }
+
+        private static byte[] BuildMaskedClientTextFrame(byte[] payload)
+        {
+            byte[] mask = new byte[] { 0x12, 0x34, 0x56, 0x78 };
+            int hdrLen = payload.Length <= 125 ? 6 : 8;
+            byte[] frame = new byte[hdrLen + payload.Length];
+            frame[0] = 0x81;
+            if (payload.Length <= 125)
+            {
+                frame[1] = (byte)(0x80 | payload.Length);
+                Buffer.BlockCopy(mask, 0, frame, 2, 4);
+            }
+            else
+            {
+                frame[1] = (byte)(0x80 | 126);
+                frame[2] = (byte)((payload.Length >> 8) & 0xFF);
+                frame[3] = (byte)(payload.Length & 0xFF);
+                Buffer.BlockCopy(mask, 0, frame, 4, 4);
+            }
+            for (int i = 0; i < payload.Length; i++)
+            {
+                frame[hdrLen + i] = (byte)(payload[i] ^ mask[i & 3]);
+            }
+            return frame;
         }
 
         private static string ReadServerTextFrame(NetworkStream ns)
