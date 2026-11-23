@@ -1,6 +1,6 @@
 # Projetinhos de PC
 
-Coleção de utilitários nativos sob medida para Windows criados para resolver necessidades reais de uso no dia a dia — controle direto de periféricos sem software pesado em segundo plano, automação inteligente ligada a jogos e indicadores em tempo real na bandeja do sistema.
+Coleção de utilitários nativos sob medida para Windows (além de configurações personalizadas de jogo) criados para resolver necessidades reais do dia a dia — controle direto de periféricos sem software pesado em segundo plano, ponte de áudio para celular com QR Code, automação inteligente ligada a jogos, indicadores em tempo real na bandeja do sistema e binds de treino no CS2.
 
 ---
 
@@ -8,20 +8,20 @@ Coleção de utilitários nativos sob medida para Windows criados para resolver 
 
 Muitos drivers e softwares de fabricantes (como suites de mouse/headset e overlays) consomem bastante memória RAM, iniciam múltiplos serviços extras e muitas vezes não oferecem exatamente o comportamento que queremos.
 
-Este repositório reúne **3 projetos independentes**, organizados por funcionalidade, que conversam diretamente com o hardware e com as APIs nativas do Windows usando apenas recursos já embutidos no sistema operacional.
+Este repositório reúne **5 projetos independentes**, organizados por funcionalidade, que conversam diretamente com o hardware, com a rede local/USB e com as APIs nativas do Windows usando apenas recursos já embutidos no sistema operacional.
 
 ---
 
 ## Lógica de pensamento por trás dos projetos
 
-Todos os scripts seguem quatro princípios:
+Todos os utilitários seguem quatro princípios:
 
 1. **Conversar direto com o hardware e com o Windows (sem camadas pesadas):**
-   Em vez de subir apps Electron/Chromium ou dependências de terceiros, usamos chamadas nativas do Windows (**Win32 P/Invoke** em `hid.dll`, `setupapi.dll`, `user32.dll`, `kernel32.dll`) para trocar pacotes HID diretamente com os receptores 2.4 GHz / USB ou ler propriedades do sistema.
+   Em vez de subir apps Electron/Chromium ou dependências de terceiros, usamos chamadas nativas do Windows (**Win32 P/Invoke** em `hid.dll`, `setupapi.dll`, `user32.dll`, `kernel32.dll` e **COM Interop WASAPI**) para trocar pacotes HID diretamente com receptores 2.4 GHz / USB, capturar áudio loopback ou ler propriedades do sistema.
 2. **Zero dependências externas de runtime:**
-   Os utilitários em C# são compilados diretamente pelo compilador nativo do **.NET Framework 4.x** (`csc.exe`) que já vem instalado em todo Windows 10/11 — basta um único executável leve (~30 KB) ou scripts PowerShell/VBScript nativos.
+   Os utilitários em C# são compilados diretamente pelo compilador nativo do **.NET Framework 4.x** (`csc.exe`) que já vem instalado em todo Windows 10/11 — basta um único executável leve ou scripts PowerShell/VBScript nativos.
 3. **Automação orientada a eventos reais:**
-   Os programas reagem ao contexto real de uso: detectam quando o *League of Legends* abre ou fecha, ajustam automaticamente o *polling rate* de 8000 Hz para 1000 Hz durante a partida, oferecem um pop-up sob demanda para carregar ou bloquear mods/overlays e atualizam ícones sem roubar o foco da tela cheia.
+   Os programas reagem ao contexto real de uso: detectam quando o *League of Legends* abre ou fecha, ajustam automaticamente o *polling rate* de 8000 Hz para 1000 Hz durante a partida, oferecem um pop-up sob demanda para carregar ou bloquear mods/overlays, detectam interfaces USB de celular plugadas no cabo e atualizam ícones sem roubar o foco da tela cheia.
 4. **Higiene de execução e estabilidade:**
    - **Instância única (`Mutex`)** para nunca duplicar processos.
    - **Limpeza de recursos** (destruição explícita de ícones `HICON` no GDI+, encerramento limpo da bandeja sem ícones fantasma e restauração de arquivos sem BOM).
@@ -35,20 +35,25 @@ Todos os scripts seguem quatro princípios:
 | :--- | :--- | :--- | :--- |
 | **ATK DPI & Polling Rate Quick Switch** | [`atk-dpi-quick-switch/`](./atk-dpi-quick-switch/README.md) | Troca instantânea de DPI (800 / 1600 / 3200) e Polling Rate (1K ↔ 8K) via atalhos globais com OSD flutuante e redução automática para 1000 Hz no LoL para evitar travamentos no motor do jogo. | C# (.NET 4.x), Win32 HID (`hid.dll` / `setupapi.dll`), `RegisterHotKey` + `Raw Input`, WinForms + GDI+, PowerShell |
 | **Rose & LTK AutoSync** | [`rose-ltk-autosync/`](./rose-ltk-autosync/README.md) | Garante que Rose, LTK Manager, Pengu Loader e Porofessor/Overwolf não fiquem abertos fora do LoL; ao abrir o cliente, abre o Porofessor e pergunta se você quer ativar Rose/LTK naquela sessão. | PowerShell, VBScript (`WScript.Shell`), Windows Task Scheduler, Registro (IFEO), WMI/CIM |
-| **Peripheral Battery Tray** | [`peripheral-battery-tray/`](./peripheral-battery-tray/README.md) | Mostra a bateria em tempo real com **1 ícone separado por periférico** fixado ao lado do `^` (ocultando dispositivos desligados por padrão) para ATK X1 Ultimate 2.0, Corsair HS80 RGB e Bluetooth automático. | C# (.NET 4.x), Win32 HID Overlapped I/O, protocolo Corsair Bragi, SetupAPI Bluetooth (`DEVPKEY_Bluetooth_Battery`), WinForms + GDI+ |
+| **Peripheral Battery Tray** | [`peripheral-battery-tray/`](./peripheral-battery-tray/README.md) | Mostra a bateria em tempo real com **1 ícone separado por periférico** na bandeja oculta (`^`) do Windows (ATK X1 Ultimate 2.0, Corsair HS80 RGB e Bluetooth automático). | C# (.NET 4.x), Win32 HID Overlapped I/O, protocolo Corsair Bragi, SetupAPI Bluetooth (`DEVPKEY_Bluetooth_Battery`), WinForms + GDI+ |
+| **Phone Audio Bridge** | [`phone-audio-bridge/`](./phone-audio-bridge/README.md) | Transforma o celular em ponte para usar fone Bluetooth no PC sem adaptador Bluetooth: captura o áudio do Windows, gera um QR Code e transmite via **Wi-Fi** ou **Cabo USB (menor delay)** para o navegador do celular. | C# (.NET 4.x), WASAPI Loopback (COM Interop), Servidor HTTP + WebSocket (RFC 6455), QR Code ISO 18004 (GF256/RS), Web Audio API, Túnel ADB/USB Tethering |
+| **CS2 Treino & Binds** | [`cs2-treino-binds/`](./cs2-treino-binds/README.md) | Arquivos `.cfg` prontos para treino no Counter-Strike 2: modo treino livre de granadas/spray com binds (`V`, `I`, `K`, `O`, `P`), modo vs 10 bots difíceis (`treino2`), `autoexec.cfg` e instalador automático. | Source 2 CFG (`treino.cfg`, `treino2.cfg`, `autoexec.cfg`), PowerShell |
 
 ---
 
 ## Tecnologias utilizadas no repositório
 
-* **C# (.NET Framework 4.x / `csc.exe`):** Linguagem principal para os utilitários de bandeja e comunicação HID de baixa latência, compilados diretamente pelo compilador nativo `C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe`.
-* **Win32 API (`P/Invoke`):**
+* **C# (.NET Framework 4.x / `csc.exe`):** Linguagem principal para os utilitários de bandeja, áudio e comunicação HID de baixa latência, compilados diretamente pelo compilador nativo `C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe`.
+* **Win32 API (`P/Invoke`) & COM Interop:**
   * `hid.dll` e `setupapi.dll`: descoberta de interfaces USB HID (`VID/PID`, `UsagePage/Usage`), leitura/escrita de relatórios HID e consulta de propriedades Bluetooth do sistema.
-  * `kernel32.dll`: I/O assíncrono (`FILE_FLAG_OVERLAPPED` + `CancelIoEx`) para evitar travamentos quando um periférico entra em repouso.
+  * **WASAPI Loopback (`IMMDeviceEnumerator`, `IAudioClient`, `IAudioCaptureClient`)**: captura direta do fluxo de áudio do Windows sem drivers virtuais nem bibliotecas externas.
+  * `kernel32.dll` / `winmm.dll`: I/O assíncrono (`FILE_FLAG_OVERLAPPED` + `CancelIoEx`) e temporização precisa (`timeBeginPeriod`).
   * `user32.dll`: atalhos globais (`RegisterHotKey`), captura direta de teclado (`Raw Input`), janelas OSD sem roubar foco (`WS_EX_NOACTIVATE`) e gerenciamento de handles `HICON`.
-* **Windows Forms + GDI+:** Renderização dinâmica de ícones 32×32 na bandeja do sistema e cards visuais com transparência e bordas arredondadas.
-* **PowerShell + VBScript (`wscript.exe`):** Automação de sistema, manipulação de processos e criação de tarefas agendadas; o `.vbs` permite rodar o monitor PowerShell em segundo plano sem piscar janela de console.
+* **Rede, WebSocket & Web Audio API:** Servidor TCP/HTTP/WebSocket (RFC 6455) em C# com fila anti-atraso, gerador de QR Code ISO/IEC 18004 com Reed-Solomon, player HTML5/Web Audio com micro-PLL adaptativo e suporte a USB Tethering / `adb reverse`.
+* **Windows Forms + GDI+:** Renderização dinâmica de ícones 32×32 na bandeja do sistema, QR Codes nítidos e cards visuais com transparência e bordas arredondadas.
+* **PowerShell + VBScript (`wscript.exe`):** Automação de sistema, manipulação de processos, regras de Firewall e criação de tarefas agendadas; o `.vbs` permite rodar o monitor PowerShell em segundo plano sem piscar janela de console.
 * **Windows Task Scheduler & Registro (`HKCU` / `HKLM`):** Inicialização automática com ou sem elevação (Admin/UIPI), configuração de persistência e controle de ganchos *Image File Execution Options (IFEO)*.
+* **Counter-Strike 2 (Source 2 CFG):** Scripts de treino com aliases, binds de utilitários e ajustes de `autoexec`.
 
 ---
 
@@ -59,19 +64,30 @@ projetinhos_de_pc/
 ├── .gitignore
 ├── README.md
 ├── atk-dpi-quick-switch/
-│   ├── AtkQuickSwitch.cs        # Código-fonte C# (HID, Raw Input, OSD, watcher LoL)
-│   ├── ConfigurarAtkAdmin.ps1   # Registra tarefa agendada elevada (Admin/UIPI)
-│   ├── build.ps1                # Compila AtkQuickSwitch.exe com csc.exe
-│   └── README.md                # Documentação detalhada do projeto
-├── rose-ltk-autosync/
-│   ├── ConfigurarTarefasRose.ps1 # Configura tarefas \Rose e \RoseAutoSync + limpeza IFEO
-│   ├── RoseAutoSync.ps1          # Monitor em loop (LoL, Rose, LTK, Pengu, Porofessor)
-│   ├── RoseAutoSync.vbs          # Launcher oculto sem janela de console
-│   └── README.md                 # Documentação detalhada do projeto
-└── peripheral-battery-tray/
-    ├── Program.cs               # Código-fonte C# (ATK + Corsair HS80 + Bluetooth + ícones)
-    ├── build.ps1                # Compila PeripheralBatteryTray.exe com csc.exe
-    └── README.md                # Documentação detalhada e explicação sobre limitações 2.4 GHz
+│   ├── AtkQuickSwitch.cs          # Código-fonte C# (HID, Raw Input, OSD, watcher LoL)
+│   ├── ConfigurarAtkAdmin.ps1     # Registra tarefa agendada elevada (Admin/UIPI)
+│   ├── build.ps1                  # Compila AtkQuickSwitch.exe com csc.exe
+│   └── README.md                  # Documentação detalhada do projeto
+├── cs2-treino-binds/
+│   ├── InstalarCfgsCS2.ps1        # Localiza a pasta cfg do CS2 e instala com backup
+│   ├── README.md                  # Lista completa das binds, aliases e uso
+│   ├── autoexec.cfg               # FPS, console, baixa latência e telemetria
+│   ├── treino.cfg                 # Treino livre (granadas, spray, noclip, binds V/I/K/O/P)
+│   └── treino2.cfg                # Treino real contra 10 bots difíceis (TR ou CT)
+├── peripheral-battery-tray/
+│   ├── Program.cs                 # Código-fonte C# (ATK + Corsair HS80 + Bluetooth + ícones)
+│   ├── build.ps1                  # Compila PeripheralBatteryTray.exe com csc.exe
+│   └── README.md                  # Documentação detalhada e explicação sobre limitações 2.4 GHz
+├── phone-audio-bridge/
+│   ├── LiberarFirewall.ps1        # Abre porta TCP 8765 no Firewall do Windows (Admin)
+│   ├── Program.cs                 # Código-fonte C# (WASAPI, HTTP/WS, QR Code, Player HTML5, UI)
+│   ├── build.ps1                  # Compila PhoneAudioBridge.exe com csc.exe
+│   └── README.md                  # Guia completo de uso em Wi-Fi e Cabo USB (menor delay)
+└── rose-ltk-autosync/
+    ├── ConfigurarTarefasRose.ps1  # Configura tarefas \Rose e \RoseAutoSync + limpeza IFEO
+    ├── RoseAutoSync.ps1           # Monitor em loop (LoL, Rose, LTK, Pengu, Porofessor)
+    ├── RoseAutoSync.vbs           # Launcher oculto sem janela de console
+    └── README.md                  # Documentação detalhada do projeto
 ```
 
 ---
@@ -114,6 +130,21 @@ cd projetinhos_de_pc
   Start-Process .\PeripheralBatteryTray.exe
   ```
   *(Clique com o botão direito em qualquer ícone gerado na setinha `^` e marque **"Iniciar com o Windows"** se desejar inicialização automática — veja [`peripheral-battery-tray/README.md`](./peripheral-battery-tray/README.md).)*
+
+* **Phone Audio Bridge:**
+  ```powershell
+  cd phone-audio-bridge
+  .\build.ps1
+  Start-Process .\PhoneAudioBridge.exe
+  ```
+  *(Escaneie o QR Code no celular para ouvir no fone Bluetooth; use o modo **Cabo USB** com Ancoragem USB ou túnel ADB para menor delay — veja [`phone-audio-bridge/README.md`](./phone-audio-bridge/README.md).)*
+
+* **CS2 Treino & Binds:**
+  ```powershell
+  cd cs2-treino-binds
+  .\InstalarCfgsCS2.ps1
+  ```
+  *(Copia `treino.cfg`, `treino2.cfg` e `autoexec.cfg` para a pasta `game\csgo\cfg` do CS2; no console do jogo execute `exec treino` ou `exec treino2` — veja [`cs2-treino-binds/README.md`](./cs2-treino-binds/README.md).)*
 
 > **Nota sobre Política de Execução do PowerShell:** caso o Windows bloqueie a execução de algum `.ps1` localmente, rode com:
 > `powershell -ExecutionPolicy Bypass -File .\nome-do-script.ps1`
