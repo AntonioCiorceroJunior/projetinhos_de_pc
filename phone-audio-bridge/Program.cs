@@ -1741,14 +1741,33 @@ namespace PhoneAudioBridge
                     if (File.Exists(candidates[i])) return candidates[i];
                 }
 
-                string pathEnv = Environment.GetEnvironmentVariable("PATH") ?? "";
-                string[] parts = pathEnv.Split(';');
-                for (int i = 0; i < parts.Length; i++)
+                string[] pathSources = new string[]
                 {
-                    string dir = parts[i].Trim();
-                    if (dir.Length == 0) continue;
-                    string p = Path.Combine(dir, "adb.exe");
-                    if (File.Exists(p)) return p;
+                    Environment.GetEnvironmentVariable("PATH") ?? "",
+                    Environment.GetEnvironmentVariable("PATH", EnvironmentVariableTarget.User) ?? "",
+                    Environment.GetEnvironmentVariable("PATH", EnvironmentVariableTarget.Machine) ?? ""
+                };
+                for (int s = 0; s < pathSources.Length; s++)
+                {
+                    string[] parts = pathSources[s].Split(';');
+                    for (int i = 0; i < parts.Length; i++)
+                    {
+                        string dir = Environment.ExpandEnvironmentVariables(parts[i].Trim().Trim('"'));
+                        if (dir.Length == 0) continue;
+                        string p = Path.Combine(dir, "adb.exe");
+                        if (File.Exists(p)) return p;
+                    }
+                }
+
+                string wingetPkgs = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"Microsoft\WinGet\Packages");
+                if (Directory.Exists(wingetPkgs))
+                {
+                    string[] dirs = Directory.GetDirectories(wingetPkgs, "Google.PlatformTools*");
+                    for (int i = 0; i < dirs.Length; i++)
+                    {
+                        string p = Path.Combine(dirs[i], @"platform-tools\adb.exe");
+                        if (File.Exists(p)) return p;
+                    }
                 }
             }
             catch
@@ -2339,7 +2358,8 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
 
       var avail = Math.max(0, availNow);
       if (avail < minAvailFrames) minAvailFrames = avail;
-      avgAvail = avgAvail * 0.94 + avail * 0.06;
+      var availMid = Math.max(0, avail - n * 0.5);
+      avgAvail = avgAvail * 0.94 + availMid * 0.06;
       var dt = n / (outRate || 48000);
       var errSec = (avgAvail - targetFrames) / srcRate;
       integral += errSec * dt;
@@ -2354,7 +2374,7 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
       smoothedRate = smoothedRate * 0.88 + targetRate * 0.12;
 
       var maxPlcDecayFrames = Math.round(srcRate * 0.028);
-      var maxPlcResetFrames = Math.round(srcRate * 0.045);
+      var maxPlcResetFrames = Math.round(srcRate * 0.085);
 
       for (var i = 0; i < n; i++) {
         var curAvail = writePos - readPos;
@@ -2542,6 +2562,7 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
       rttMs: latestRttMs,
       targetMs: targetBufferMs
     });
+    if (!workerPipelineActive) latestWsGapMax = 0;
     if (netWorker) {
       try { netWorker.postMessage({ type: 'sendText', text: payload }); } catch (e) {}
     } else if (ws && ws.readyState === 1) {
@@ -2765,6 +2786,8 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
   function buildNetWorkerCode() {
     return 'var ws = null;\n' +
       'var audioPort = null;\n' +
+      'var loopbackAck = false;\n' +
+      'var ackBuf = new Uint8Array([6]);\n' +
       'var pingTimer = null;\n' +
       'var gapTimer = null;\n' +
       'var lastBinMs = 0;\n' +
@@ -2774,6 +2797,7 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
       '  if (!d) return;\n' +
       '  if (d.type === \'init\') {\n' +
       '    audioPort = d.audioPort;\n' +
+      '    loopbackAck = !!d.loopbackAck;\n' +
       '    ws = new WebSocket(d.wsUrl);\n' +
       '    ws.binaryType = \'arraybuffer\';\n' +
       '    ws.onopen = function() {\n' +
@@ -2805,6 +2829,7 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
       '        }\n' +
       '        lastBinMs = now;\n' +
       '        if (audioPort) audioPort.postMessage(wev.data, [wev.data]);\n' +
+      '        if (loopbackAck && ws && ws.readyState === 1) { try { ws.send(ackBuf); } catch (e) {} }\n' +
       '      }\n' +
       '    };\n' +
       '    ws.onclose = function() {\n' +
@@ -2851,6 +2876,7 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
     }
     var proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
     var wsUrl = proto + location.host + '/ws';
+    var isLoopbackHost = (location.hostname === '127.0.0.1' || location.hostname === 'localhost');
     setStatus('wait', 'Conectando ao PC...', 'Abrindo canal Worker + Worklet');
     var ch = new MessageChannel();
     audioNode.port.postMessage({ type: 'netPort', port: ch.port1 }, [ch.port1]);
@@ -2881,7 +2907,7 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
       }
     };
 
-    netWorker.postMessage({ type: 'init', wsUrl: wsUrl, audioPort: ch.port2 }, [ch.port2]);
+    netWorker.postMessage({ type: 'init', wsUrl: wsUrl, audioPort: ch.port2, loopbackAck: isLoopbackHost }, [ch.port2]);
   }
 
   function startSessionPipeline() {
@@ -2983,6 +3009,8 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
     }
 
     var proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+    var isLoopbackHost = (location.hostname === '127.0.0.1' || location.hostname === 'localhost');
+    var ackBuf = new Uint8Array([6]);
     var lastBinMs = 0;
     setStatus('wait', 'Conectando ao PC...', 'Abrindo canal de baixa latência');
     ws = new WebSocket(proto + location.host + '/ws');
@@ -3018,6 +3046,7 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
         }
         lastBinMs = now;
         dispatchAudioFrame(ev.data);
+        if (isLoopbackHost && ws && ws.readyState === 1) { try { ws.send(ackBuf); } catch (e) {} }
       }
     };
 
@@ -3279,49 +3308,53 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
 
         private void ReaderLoop()
         {
+            byte[] hdr2 = new byte[2];
+            byte[] extLenBuf = new byte[8];
+            byte[] maskBuf = new byte[4];
+            byte[] smallBinBuf = new byte[16];
             try
             {
                 while (!_closed)
                 {
-                    int b0 = _stream.ReadByte();
-                    if (b0 < 0) break;
-                    int b1 = _stream.ReadByte();
-                    if (b1 < 0) break;
+                    if (!ReadExactInto(_stream, hdr2, 2)) break;
 
-                    int opcode = b0 & 0x0F;
-                    bool masked = (b1 & 0x80) != 0;
-                    long len = b1 & 0x7F;
+                    int opcode = hdr2[0] & 0x0F;
+                    bool masked = (hdr2[1] & 0x80) != 0;
+                    long len = hdr2[1] & 0x7F;
 
                     if (len == 126)
                     {
-                        byte[] ext = ReadExact(_stream, 2);
-                        if (ext == null) break;
-                        len = (ext[0] << 8) | ext[1];
+                        if (!ReadExactInto(_stream, extLenBuf, 2)) break;
+                        len = (extLenBuf[0] << 8) | extLenBuf[1];
                     }
                     else if (len == 127)
                     {
-                        byte[] ext = ReadExact(_stream, 8);
-                        if (ext == null) break;
+                        if (!ReadExactInto(_stream, extLenBuf, 8)) break;
                         len = 0;
-                        for (int i = 0; i < 8; i++) len = (len << 8) | ext[i];
+                        for (int i = 0; i < 8; i++) len = (len << 8) | extLenBuf[i];
                     }
 
-                    byte[] maskKey = null;
                     if (masked)
                     {
-                        maskKey = ReadExact(_stream, 4);
-                        if (maskKey == null) break;
+                        if (!ReadExactInto(_stream, maskBuf, 4)) break;
                     }
 
-                    if (len > 1048576) break;
-                    byte[] payload = len > 0 ? ReadExact(_stream, (int)len) : new byte[0];
-                    if (payload == null) break;
+                    if (len > 1048576 || len < 0) break;
 
-                    if (masked && maskKey != null)
+                    if (opcode == 0x2 && len <= smallBinBuf.Length)
+                    {
+                        if (len > 0 && !ReadExactInto(_stream, smallBinBuf, (int)len)) break;
+                        continue;
+                    }
+
+                    byte[] payload = len > 0 ? new byte[(int)len] : new byte[0];
+                    if (len > 0 && !ReadExactInto(_stream, payload, (int)len)) break;
+
+                    if (masked)
                     {
                         for (int i = 0; i < payload.Length; i++)
                         {
-                            payload[i] ^= maskKey[i & 3];
+                            payload[i] ^= maskBuf[i & 3];
                         }
                     }
 
@@ -3359,17 +3392,16 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
             }
         }
 
-        private static byte[] ReadExact(Stream s, int count)
+        private static bool ReadExactInto(Stream s, byte[] buf, int count)
         {
-            byte[] buf = new byte[count];
             int read = 0;
             while (read < count)
             {
                 int n = s.Read(buf, read, count - read);
-                if (n <= 0) return null;
+                if (n <= 0) return false;
                 read += n;
             }
-            return buf;
+            return true;
         }
 
         public void Dispose()
@@ -4906,6 +4938,7 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
                 bool htmlValid = htmlResp.Contains("200 OK") &&
                     htmlResp.Contains("AudioWorklet") &&
                     htmlResp.Contains("buildNetWorkerCode") &&
+                    htmlResp.Contains("loopbackAck") &&
                     htmlResp.Contains("ringL") &&
                     htmlResp.Contains("disconnectSession") &&
                     !htmlResp.Contains("reconnectTimer") &&
@@ -5011,6 +5044,14 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
                         return false;
                     }
 
+                    // Send 5 masked 1-byte binary ACK frames (loopback reverse-ACK fast path)
+                    byte[] ackFrame = BuildMaskedClientBinaryFrame(new byte[] { 0x06 });
+                    for (int i = 0; i < 5; i++)
+                    {
+                        ns.Write(ackFrame, 0, ackFrame.Length);
+                    }
+                    ns.Flush();
+
                     // Send masked ping text frame
                     byte[] pingPayload = Encoding.UTF8.GetBytes("{\"type\":\"ping\",\"t\":123}");
                     byte[] pingFrame = BuildMaskedClientTextFrame(pingPayload);
@@ -5037,7 +5078,7 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
                         return false;
                     }
 
-                    info = "101+config+pong+stats OK";
+                    info = "101+config+ack5+pong+stats OK";
                     return true;
                 }
             }
@@ -5045,10 +5086,20 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
 
         private static byte[] BuildMaskedClientTextFrame(byte[] payload)
         {
+            return BuildMaskedClientFrame(0x81, payload);
+        }
+
+        private static byte[] BuildMaskedClientBinaryFrame(byte[] payload)
+        {
+            return BuildMaskedClientFrame(0x82, payload);
+        }
+
+        private static byte[] BuildMaskedClientFrame(byte firstByte, byte[] payload)
+        {
             byte[] mask = new byte[] { 0x12, 0x34, 0x56, 0x78 };
             int hdrLen = payload.Length <= 125 ? 6 : 8;
             byte[] frame = new byte[hdrLen + payload.Length];
-            frame[0] = 0x81;
+            frame[0] = firstByte;
             if (payload.Length <= 125)
             {
                 frame[1] = (byte)(0x80 | payload.Length);

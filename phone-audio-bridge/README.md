@@ -55,7 +55,10 @@ Para manter o áudio liso em **10–15 ms** sem picotes mesmo no navegador do ce
    - Se algum pacote atrasar 1–6 ms, o **PLC (*Packet Loss Concealment*)** espelha suavemente a forma de onda recente com decaimento e retorna ao áudio real com **crossfade Hann (cosseno elevado)** — sem salto de degrau ("pipoco").
 4. **Telemetria ao vivo no PC e em `/api/info`:**
    - A cada ~400 ms, o navegador envia de volta ao PC o estado real do buffer (`bufMs`, `minBufMs`), o maior intervalo recebido no USB (`wsGapMaxMs`), cortes por segundo (`plcPerSec`) e resyncs — exibidos em tempo real no rodapé da janela do Windows e em `GET /api/info` (`clientStats`).
-5. **Atenção à latência do próprio Bluetooth (Celular → Fone):**
+5. **Reverse-ACK na interface loopback/ADB (`127.0.0.1`):**
+   - No túnel `adb reverse`, o daemon `adbd` do Android aceita conexões locais em `127.0.0.1` sem `TCP_NODELAY`. Como a MTU de loopback no Linux é `65536` bytes, pacotes de `1932` bytes (~10 ms) em stream só de descida ficam retidos pelo algoritmo de Nagle aguardando o *Delayed ACK* do kernel (`40–60 ms`), gerando rajadas de ~47 ms (`wsGapMaxMs`).
+   - Quando conectado em `127.0.0.1`/`localhost`, o `Web Worker` envia um ACK binário mínimo de `1` byte por bloco recebido (consumido sem alocação em `WsClientSession.ReaderLoop`), forçando a pilha TCP a emitir o ACK imediato, zerando a fila `Send-Q` no `adbd` e mantendo o fluxo liso em `~10 ms`.
+6. **Atenção à latência do próprio Bluetooth (Celular → Fone):**
    - A ponte **PC → Celular** consegue rodar em **10–15 ms** pelo Cabo USB, mas o enlace **Bluetooth** entre o celular e o fone adiciona sua própria latência (tipicamente **100–200 ms** em SBC/AAC comum, ou **40–80 ms** em modos *Low Latency* / *Gaming Mode* do fone). Para menor atraso total em vídeos e jogos, ative o **Modo Jogo / Baixa Latência** do seu fone Bluetooth (quando disponível).
 
 ---
