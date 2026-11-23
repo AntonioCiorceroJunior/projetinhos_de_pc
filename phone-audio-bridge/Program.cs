@@ -2253,6 +2253,7 @@ namespace PhoneAudioBridge
             Controls.Add(btnNo);
             AcceptButton = btnYes;
             CancelButton = btnNo;
+            Shown += delegate { Activate(); BringToFront(); };
         }
     }
 
@@ -2279,7 +2280,13 @@ namespace PhoneAudioBridge
         private bool _forceExit;
         private bool _popupOpen;
         private bool _connecting;
+        private readonly bool _startMinimized;
         private bool _autoConnectRequested;
+        private bool _initialScanDone;
+        private bool _adbPollInFlight;
+        private EventWaitHandle _showWindowEvent;
+        private Thread _showEventThread;
+        private volatile bool _disposing;
         private long _lastPingMs;
         private long _lastLiveJsonMs;
         private int _adbPollCounter;
@@ -2313,6 +2320,7 @@ namespace PhoneAudioBridge
 
         public MainBridgeForm(bool startMinimized, bool autoConnect)
         {
+            _startMinimized = startMinimized;
             _autoConnectRequested = autoConnect;
             _adbExe = AdbHelper.FindAdbExecutable();
 
@@ -2360,18 +2368,69 @@ namespace PhoneAudioBridge
             BuildTray();
 
             RefreshAudioDevices();
-            RefreshAdbDevices(true);
             _capture.Start();
+
+            try
+            {
+                _showWindowEvent = new EventWaitHandle(false, EventResetMode.AutoReset, "Local\\PhoneAudioBridge_ShowWindow");
+                _showEventThread = new Thread(WaitForShowSignalLoop);
+                _showEventThread.IsBackground = true;
+                _showEventThread.Start();
+            }
+            catch
+            {
+            }
 
             _uiTimer = new System.Windows.Forms.Timer();
             _uiTimer.Interval = 120;
             _uiTimer.Tick += OnUiTick;
             _uiTimer.Start();
 
-            if (startMinimized)
+            Shown += OnFirstShown;
+        }
+
+        private void OnFirstShown(object sender, EventArgs e)
+        {
+            Shown -= OnFirstShown;
+            if (_startMinimized)
             {
-                WindowState = FormWindowState.Minimized;
-                ShowInTaskbar = false;
+                HideToTray();
+            }
+            else
+            {
+                ShowInTaskbar = true;
+                Activate();
+            }
+            if (!_initialScanDone)
+            {
+                _initialScanDone = true;
+                RefreshAdbDevicesAsync(true);
+            }
+        }
+
+        private void WaitForShowSignalLoop()
+        {
+            while (!_disposing)
+            {
+                try
+                {
+                    if (_showWindowEvent == null || !_showWindowEvent.WaitOne()) break;
+                }
+                catch
+                {
+                    break;
+                }
+                if (_disposing) break;
+                try
+                {
+                    if (IsHandleCreated && !IsDisposed)
+                    {
+                        BeginInvoke((MethodInvoker)delegate { ShowFromTray(); });
+                    }
+                }
+                catch
+                {
+                }
             }
         }
 
@@ -2432,7 +2491,7 @@ namespace PhoneAudioBridge
                 FlatStyle = FlatStyle.Flat
             };
             var btnRefreshUsb = MakeButton("Atualizar", lx + 432, 101, 84, 28, Color.FromArgb(35, 43, 59));
-            btnRefreshUsb.Click += delegate { RefreshAdbDevices(true); };
+            btnRefreshUsb.Click += delegate { RefreshAdbDevicesAsync(true); };
             _lblPhoneState = new Label
             {
                 Text = "Procurando celular USB...",
@@ -2707,12 +2766,68 @@ namespace PhoneAudioBridge
             }
         }
 
-        private void RefreshAdbDevices(bool rescanAdbPath)
+        private void RefreshAdbDevicesSync(bool rescanAdbPath)
         {
             if (rescanAdbPath || string.IsNullOrEmpty(_adbExe))
             {
                 _adbExe = AdbHelper.FindAdbExecutable();
             }
+            var devs = !string.IsNullOrEmpty(_adbExe) ? AdbHelper.ListOnlineDevices(_adbExe) : new List<AdbDeviceInfo>();
+            ApplyAdbDeviceList(_adbExe, devs);
+        }
+
+        private void RefreshAdbDevicesAsync(bool rescanAdbPath)
+        {
+            if (_disposing || _adbPollInFlight || !IsHandleCreated) return;
+            _adbPollInFlight = true;
+            string currentAdb = _adbExe;
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                string foundAdb = currentAdb;
+                List<AdbDeviceInfo> devs = null;
+                try
+                {
+                    if (rescanAdbPath || string.IsNullOrEmpty(foundAdb))
+                    {
+                        foundAdb = AdbHelper.FindAdbExecutable();
+                    }
+                    if (!string.IsNullOrEmpty(foundAdb))
+                    {
+                        devs = AdbHelper.ListOnlineDevices(foundAdb);
+                    }
+                }
+                catch
+                {
+                }
+                try
+                {
+                    if (!_disposing && IsHandleCreated && !IsDisposed)
+                    {
+                        BeginInvoke((MethodInvoker)delegate
+                        {
+                            try
+                            {
+                                ApplyAdbDeviceList(foundAdb, devs ?? new List<AdbDeviceInfo>());
+                            }
+                            finally
+                            {
+                                _adbPollInFlight = false;
+                            }
+                        });
+                        return;
+                    }
+                }
+                catch
+                {
+                }
+                _adbPollInFlight = false;
+            });
+        }
+
+        private void ApplyAdbDeviceList(string adbPath, List<AdbDeviceInfo> devs)
+        {
+            if (_disposing || IsDisposed) return;
+            _adbExe = adbPath ?? "";
 
             if (string.IsNullOrEmpty(_adbExe))
             {
@@ -2722,7 +2837,7 @@ namespace PhoneAudioBridge
                 return;
             }
 
-            var devs = AdbHelper.ListOnlineDevices(_adbExe);
+            if (devs == null) devs = new List<AdbDeviceInfo>();
             var presentSerials = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
             AdbDeviceInfo prevSel = _cmbDevices.SelectedItem as AdbDeviceInfo;
@@ -2791,6 +2906,13 @@ namespace PhoneAudioBridge
             }
         }
 
+        private DialogResult ShowOwnedOrTopPrompt(Form dlg)
+        {
+            return (Visible && WindowState != FormWindowState.Minimized && IsHandleCreated)
+                ? dlg.ShowDialog(this)
+                : dlg.ShowDialog();
+        }
+
         private void PromptConnectOnPlug(AdbDeviceInfo dev)
         {
             if (_popupOpen || _connecting) return;
@@ -2803,7 +2925,7 @@ namespace PhoneAudioBridge
                     "O túnel nativo C++ AAudio inicia em ~1 segundo (padrão 10 ms), sem abrir navegador nem QR Code.";
                 using (var dlg = new DarkPromptDialog(title, head, body, "Sim, Conectar Áudio", "Não agora", Color.FromArgb(74, 222, 128)))
                 {
-                    if (dlg.ShowDialog(this) == DialogResult.Yes)
+                    if (ShowOwnedOrTopPrompt(dlg) == DialogResult.Yes)
                     {
                         ConnectDevice(dev);
                     }
@@ -2820,7 +2942,7 @@ namespace PhoneAudioBridge
             AdbDeviceInfo sel = _cmbDevices.SelectedItem as AdbDeviceInfo;
             if (sel == null)
             {
-                RefreshAdbDevices(true);
+                RefreshAdbDevicesSync(true);
                 sel = _cmbDevices.SelectedItem as AdbDeviceInfo;
             }
             if (sel == null)
@@ -3042,7 +3164,7 @@ namespace PhoneAudioBridge
                     "(Se clicar em Não, este aviso não aparecerá novamente.)";
                 using (var dlg = new DarkPromptDialog(title, head, body, "Sim, Estabilizar Agora", "Não, manter", Color.FromArgb(251, 191, 36)))
                 {
-                    if (dlg.ShowDialog(this) == DialogResult.Yes)
+                    if (ShowOwnedOrTopPrompt(dlg) == DialogResult.Yes)
                     {
                         _adaptive.StartStabilizing(_sessionClock.ElapsedMilliseconds);
                         ApplyTargetMsFromAdaptive(_adaptive.TargetMs);
@@ -3133,12 +3255,18 @@ namespace PhoneAudioBridge
                 WriteLiveSnapshot();
             }
 
+            if (!_initialScanDone && IsHandleCreated)
+            {
+                _initialScanDone = true;
+                RefreshAdbDevicesAsync(true);
+            }
+
             _adbPollCounter++;
             int pollEvery = (activeCli != null && activeCli.IsConnected) ? 25 : 12;
             if (_adbPollCounter >= pollEvery)
             {
                 _adbPollCounter = 0;
-                RefreshAdbDevices(false);
+                RefreshAdbDevicesAsync(false);
             }
         }
 
@@ -3208,9 +3336,16 @@ namespace PhoneAudioBridge
 
         private void ShowFromTray()
         {
-            ShowInTaskbar = true;
+            if (!ShowInTaskbar)
+            {
+                ShowInTaskbar = true;
+            }
             Show();
-            WindowState = FormWindowState.Normal;
+            if (WindowState == FormWindowState.Minimized)
+            {
+                WindowState = FormWindowState.Normal;
+            }
+            BringToFront();
             Activate();
         }
 
@@ -3254,6 +3389,13 @@ namespace PhoneAudioBridge
 
         private void CleanupAll()
         {
+            _disposing = true;
+            if (_showWindowEvent != null)
+            {
+                try { _showWindowEvent.Set(); } catch { }
+                try { _showWindowEvent.Close(); } catch { }
+                _showWindowEvent = null;
+            }
             if (_uiTimer != null)
             {
                 _uiTimer.Stop();
@@ -3686,12 +3828,23 @@ namespace PhoneAudioBridge
             {
                 if (!createdNew)
                 {
-                    MessageBox.Show(
-                        "O Phone Audio Bridge já está aberto! Procure o ícone na bandeja do sistema (^).",
-                        "Phone Audio Bridge",
-                        MessageBoxButtons.OK,
-                        MessageBoxIcon.Information);
-                    return 0;
+                    try
+                    {
+                        using (var ev = EventWaitHandle.OpenExisting("Local\\PhoneAudioBridge_ShowWindow"))
+                        {
+                            ev.Set();
+                            return 0;
+                        }
+                    }
+                    catch
+                    {
+                        MessageBox.Show(
+                            "O Phone Audio Bridge já está aberto! Procure o ícone na bandeja do sistema (^).",
+                            "Phone Audio Bridge",
+                            MessageBoxButtons.OK,
+                            MessageBoxIcon.Information);
+                        return 0;
+                    }
                 }
 
                 Application.EnableVisualStyles();
