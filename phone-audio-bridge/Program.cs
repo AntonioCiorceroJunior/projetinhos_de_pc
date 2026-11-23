@@ -97,6 +97,12 @@ namespace PhoneAudioBridge
 
         [DllImport("ole32.dll")]
         public static extern int PropVariantClear(ref PropVariant pvar);
+
+        [DllImport("avrt.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern IntPtr AvSetMmThreadCharacteristicsW(string taskName, ref uint taskIndex);
+
+        [DllImport("avrt.dll", SetLastError = true)]
+        public static extern bool AvRevertMmThreadCharacteristics(IntPtr avrtHandle);
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -283,6 +289,7 @@ namespace PhoneAudioBridge
         private const int ClsCtxAll = 23;
         private const int AudclntShareModeShared = 0;
         private const int AudclntStreamFlagsLoopback = 0x00020000;
+        private const int AudclntStreamFlagsEventCallback = 0x00040000;
         private const uint AudclntBufferFlagsSilent = 0x2;
         private const int AudclntDeviceInvalidated = unchecked((int)0x88890004);
         private const ushort WaveFormatPcm = 1;
@@ -458,32 +465,64 @@ namespace PhoneAudioBridge
                 }
 
                 WAVEFORMATEX wfx = (WAVEFORMATEX)Marshal.PtrToStructure(mixFormatPtr, typeof(WAVEFORMATEX));
-                hr = audioClient.Initialize(AudclntShareModeShared, AudclntStreamFlagsLoopback, 500000, 0, mixFormatPtr, IntPtr.Zero);
-                if (hr != 0)
+                bool eventDriven = false;
+                AutoResetEvent probeEvent = null;
+                try
                 {
-                    return string.Format("ERR Initialize Loopback HR=0x{0:X8}", hr);
-                }
+                    hr = audioClient.Initialize(AudclntShareModeShared, AudclntStreamFlagsLoopback | AudclntStreamFlagsEventCallback, 200000, 0, mixFormatPtr, IntPtr.Zero);
+                    if (hr == 0)
+                    {
+                        probeEvent = new AutoResetEvent(false);
+                        if (audioClient.SetEventHandle(probeEvent.SafeWaitHandle.DangerousGetHandle()) == 0)
+                        {
+                            eventDriven = true;
+                        }
+                    }
 
-                object capObj;
-                Guid iidCap = IidAudioCaptureClient;
-                hr = audioClient.GetService(ref iidCap, out capObj);
-                if (hr != 0 || capObj == null)
+                    if (!eventDriven)
+                    {
+                        if (probeEvent != null) { probeEvent.Close(); probeEvent = null; }
+                        Marshal.ReleaseComObject(audioClient);
+                        audioClient = null;
+                        hr = device.Activate(ref iidClient, ClsCtxAll, IntPtr.Zero, out clientObj);
+                        if (hr != 0 || clientObj == null)
+                        {
+                            return string.Format("ERR ReActivate IAudioClient HR=0x{0:X8}", hr);
+                        }
+                        audioClient = (IAudioClient)clientObj;
+                        hr = audioClient.Initialize(AudclntShareModeShared, AudclntStreamFlagsLoopback, 200000, 0, mixFormatPtr, IntPtr.Zero);
+                        if (hr != 0)
+                        {
+                            return string.Format("ERR Initialize Loopback HR=0x{0:X8}", hr);
+                        }
+                    }
+
+                    object capObj;
+                    Guid iidCap = IidAudioCaptureClient;
+                    hr = audioClient.GetService(ref iidCap, out capObj);
+                    if (hr != 0 || capObj == null)
+                    {
+                        return string.Format("ERR GetService IAudioCaptureClient HR=0x{0:X8}", hr);
+                    }
+                    captureClient = (IAudioCaptureClient)capObj;
+
+                    hr = audioClient.Start();
+                    if (hr != 0)
+                    {
+                        return string.Format("ERR Start HR=0x{0:X8}", hr);
+                    }
+                    if (probeEvent != null) probeEvent.WaitOne(25);
+                    else Thread.Sleep(25);
+                    uint nextPkt;
+                    captureClient.GetNextPacketSize(out nextPkt);
+                    audioClient.Stop();
+
+                    return string.Format("OK device=\"{0}\" rate={1}Hz ch={2} bits={3} tag=0x{4:X} eventDriven={5}", friendly, wfx.nSamplesPerSec, wfx.nChannels, wfx.wBitsPerSample, wfx.wFormatTag, eventDriven);
+                }
+                finally
                 {
-                    return string.Format("ERR GetService IAudioCaptureClient HR=0x{0:X8}", hr);
+                    if (probeEvent != null) probeEvent.Close();
                 }
-                captureClient = (IAudioCaptureClient)capObj;
-
-                hr = audioClient.Start();
-                if (hr != 0)
-                {
-                    return string.Format("ERR Start HR=0x{0:X8}", hr);
-                }
-                Thread.Sleep(25);
-                uint nextPkt;
-                captureClient.GetNextPacketSize(out nextPkt);
-                audioClient.Stop();
-
-                return string.Format("OK device=\"{0}\" rate={1}Hz ch={2} bits={3} tag=0x{4:X}", friendly, wfx.nSamplesPerSec, wfx.nChannels, wfx.wBitsPerSample, wfx.wFormatTag);
             }
             catch (Exception ex)
             {
@@ -507,7 +546,7 @@ namespace PhoneAudioBridge
             _thread = new Thread(CaptureThreadMain);
             _thread.IsBackground = true;
             _thread.Name = "WASAPI-Loopback-Capture";
-            _thread.Priority = ThreadPriority.AboveNormal;
+            _thread.Priority = ThreadPriority.Highest;
             _thread.Start();
         }
 
@@ -556,9 +595,18 @@ namespace PhoneAudioBridge
         {
             int hrCo = NativeWin32.CoInitializeEx(IntPtr.Zero, 0);
             bool timerPeriodSet = false;
+            IntPtr mmcssHandle = IntPtr.Zero;
             try
             {
                 timerPeriodSet = NativeWin32.timeBeginPeriod(1) == 0;
+            }
+            catch
+            {
+            }
+            try
+            {
+                uint taskIdx = 0;
+                mmcssHandle = NativeWin32.AvSetMmThreadCharacteristicsW("Pro Audio", ref taskIdx);
             }
             catch
             {
@@ -587,6 +635,10 @@ namespace PhoneAudioBridge
             }
             finally
             {
+                if (mmcssHandle != IntPtr.Zero)
+                {
+                    try { NativeWin32.AvRevertMmThreadCharacteristics(mmcssHandle); } catch { }
+                }
                 if (timerPeriodSet)
                 {
                     try { NativeWin32.timeEndPeriod(1); } catch { }
@@ -605,6 +657,8 @@ namespace PhoneAudioBridge
             IAudioClient audioClient = null;
             IAudioCaptureClient captureClient = null;
             IntPtr mixFormatPtr = IntPtr.Zero;
+
+            AutoResetEvent audioEvent = null;
 
             try
             {
@@ -684,11 +738,34 @@ namespace PhoneAudioBridge
                     OnFormatChanged(outRate, friendly);
                 }
 
-                hr = audioClient.Initialize(AudclntShareModeShared, AudclntStreamFlagsLoopback, 500000, 0, mixFormatPtr, IntPtr.Zero);
-                if (hr != 0)
+                hr = audioClient.Initialize(AudclntShareModeShared, AudclntStreamFlagsLoopback | AudclntStreamFlagsEventCallback, 200000, 0, mixFormatPtr, IntPtr.Zero);
+                if (hr == 0)
                 {
-                    LastError = string.Format("Falha em Initialize Loopback (0x{0:X8}).", hr);
-                    return;
+                    audioEvent = new AutoResetEvent(false);
+                    if (audioClient.SetEventHandle(audioEvent.SafeWaitHandle.DangerousGetHandle()) != 0)
+                    {
+                        audioEvent.Close();
+                        audioEvent = null;
+                    }
+                }
+
+                if (audioEvent == null)
+                {
+                    Marshal.ReleaseComObject(audioClient);
+                    audioClient = null;
+                    hr = device.Activate(ref iidClient, ClsCtxAll, IntPtr.Zero, out clientObj);
+                    if (hr != 0 || clientObj == null)
+                    {
+                        LastError = string.Format("Falha ao reativar áudio (0x{0:X8}).", hr);
+                        return;
+                    }
+                    audioClient = (IAudioClient)clientObj;
+                    hr = audioClient.Initialize(AudclntShareModeShared, AudclntStreamFlagsLoopback, 200000, 0, mixFormatPtr, IntPtr.Zero);
+                    if (hr != 0)
+                    {
+                        LastError = string.Format("Falha em Initialize Loopback (0x{0:X8}).", hr);
+                        return;
+                    }
                 }
 
                 object capObj;
@@ -771,7 +848,14 @@ namespace PhoneAudioBridge
                             }
                         }
 
-                        Thread.Sleep(1);
+                        if (audioEvent != null)
+                        {
+                            audioEvent.WaitOne(12);
+                        }
+                        else
+                        {
+                            Thread.Sleep(1);
+                        }
                         continue;
                     }
 
@@ -800,24 +884,17 @@ namespace PhoneAudioBridge
                                 bool isSilentFlag = (flags & AudclntBufferFlagsSilent) != 0;
                                 int outFrames = (frames + decimFactor - 1) / decimFactor;
                                 int pcmBytes = outFrames * 4;
-                                if (accumOffset + pcmBytes > accum.Length)
-                                {
-                                    byte[] grown = new byte[(accumOffset + pcmBytes) * 2];
-                                    Buffer.BlockCopy(accum, 0, grown, 0, accumOffset);
-                                    accum = grown;
-                                }
 
-                                float peak = 0f;
-                                if (!isSilentFlag && dataPtr != IntPtr.Zero)
+                                if (accumOffset == 0 && pcmBytes == targetChunkBytes && !isSilentFlag && dataPtr != IntPtr.Zero)
                                 {
-                                    int rawBytes = frames * blockAlign;
-                                    if (rawBytes > rawScratch.Length)
+                                    int rawBytesFast = frames * blockAlign;
+                                    if (rawBytesFast > rawScratch.Length)
                                     {
-                                        rawScratch = new byte[rawBytes];
+                                        rawScratch = new byte[rawBytesFast];
                                     }
-                                    Marshal.Copy(dataPtr, rawScratch, 0, rawBytes);
-
-                                    peak = ConvertToInt16Stereo(
+                                    Marshal.Copy(dataPtr, rawScratch, 0, rawBytesFast);
+                                    byte[] directChunk = new byte[targetChunkBytes];
+                                    float peakFast = ConvertToInt16Stereo(
                                         rawScratch,
                                         frames,
                                         srcChannels,
@@ -825,39 +902,76 @@ namespace PhoneAudioBridge
                                         blockAlign,
                                         isFloat,
                                         decimFactor,
-                                        accum,
-                                        accumOffset);
+                                        directChunk,
+                                        0);
+                                    CurrentLevel = CurrentLevel * 0.65f + Math.Min(1f, peakFast * 1.4f) * 0.35f;
+                                    lastPacketTick = Environment.TickCount;
+                                    if (OnPcmPacket != null)
+                                    {
+                                        OnPcmPacket(directChunk, outRate);
+                                    }
                                 }
                                 else
                                 {
-                                    Array.Clear(accum, accumOffset, pcmBytes);
-                                }
-
-                                float smoothed = CurrentLevel * 0.65f + Math.Min(1f, peak * 1.4f) * 0.35f;
-                                CurrentLevel = smoothed;
-                                lastPacketTick = Environment.TickCount;
-
-                                accumOffset += pcmBytes;
-                                int sendOffset = 0;
-                                while (accumOffset - sendOffset >= targetChunkBytes)
-                                {
-                                    byte[] chunk = new byte[targetChunkBytes];
-                                    Buffer.BlockCopy(accum, sendOffset, chunk, 0, targetChunkBytes);
-                                    if (OnPcmPacket != null)
+                                    if (accumOffset + pcmBytes > accum.Length)
                                     {
-                                        OnPcmPacket(chunk, outRate);
+                                        byte[] grown = new byte[(accumOffset + pcmBytes) * 2];
+                                        Buffer.BlockCopy(accum, 0, grown, 0, accumOffset);
+                                        accum = grown;
                                     }
-                                    sendOffset += targetChunkBytes;
-                                }
 
-                                if (sendOffset > 0)
-                                {
-                                    int rem = accumOffset - sendOffset;
-                                    if (rem > 0)
+                                    float peak = 0f;
+                                    if (!isSilentFlag && dataPtr != IntPtr.Zero)
                                     {
-                                        Buffer.BlockCopy(accum, sendOffset, accum, 0, rem);
+                                        int rawBytes = frames * blockAlign;
+                                        if (rawBytes > rawScratch.Length)
+                                        {
+                                            rawScratch = new byte[rawBytes];
+                                        }
+                                        Marshal.Copy(dataPtr, rawScratch, 0, rawBytes);
+
+                                        peak = ConvertToInt16Stereo(
+                                            rawScratch,
+                                            frames,
+                                            srcChannels,
+                                            srcBits,
+                                            blockAlign,
+                                            isFloat,
+                                            decimFactor,
+                                            accum,
+                                            accumOffset);
                                     }
-                                    accumOffset = rem;
+                                    else
+                                    {
+                                        Array.Clear(accum, accumOffset, pcmBytes);
+                                    }
+
+                                    float smoothed = CurrentLevel * 0.65f + Math.Min(1f, peak * 1.4f) * 0.35f;
+                                    CurrentLevel = smoothed;
+                                    lastPacketTick = Environment.TickCount;
+
+                                    accumOffset += pcmBytes;
+                                    int sendOffset = 0;
+                                    while (accumOffset - sendOffset >= targetChunkBytes)
+                                    {
+                                        byte[] chunk = new byte[targetChunkBytes];
+                                        Buffer.BlockCopy(accum, sendOffset, chunk, 0, targetChunkBytes);
+                                        if (OnPcmPacket != null)
+                                        {
+                                            OnPcmPacket(chunk, outRate);
+                                        }
+                                        sendOffset += targetChunkBytes;
+                                    }
+
+                                    if (sendOffset > 0)
+                                    {
+                                        int rem = accumOffset - sendOffset;
+                                        if (rem > 0)
+                                        {
+                                            Buffer.BlockCopy(accum, sendOffset, accum, 0, rem);
+                                        }
+                                        accumOffset = rem;
+                                    }
                                 }
                             }
                         }
@@ -879,6 +993,10 @@ namespace PhoneAudioBridge
                 if (audioClient != null)
                 {
                     try { audioClient.Stop(); } catch { }
+                }
+                if (audioEvent != null)
+                {
+                    try { audioEvent.Close(); } catch { }
                 }
                 if (mixFormatPtr != IntPtr.Zero) Marshal.FreeCoTaskMem(mixFormatPtr);
                 if (captureClient != null) Marshal.ReleaseComObject(captureClient);
@@ -1976,13 +2094,13 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
     <div class=""ctrl"">
       <div class=""ctrl-head"">
         <span>Buffer Alvo (menor = menos atraso)</span>
-        <span id=""bufLbl"" class=""ctrl-val"">90 ms</span>
+        <span id=""bufLbl"" class=""ctrl-val"">60 ms</span>
       </div>
-      <input id=""bufSlider"" type=""range"" min=""25"" max=""220"" step=""5"" value=""90"">
+      <input id=""bufSlider"" type=""range"" min=""10"" max=""180"" step=""5"" value=""60"">
       <div class=""presets"">
-        <button class=""chip"" data-ms=""35"" type=""button"">USB 35ms</button>
-        <button class=""chip"" data-ms=""65"" type=""button"">Normal 65ms</button>
-        <button class=""chip"" data-ms=""110"" type=""button"">Estável 110ms</button>
+        <button class=""chip"" data-ms=""10"" type=""button"">Ultra 10ms</button>
+        <button class=""chip"" data-ms=""15"" type=""button"">USB 15ms</button>
+        <button class=""chip"" data-ms=""60"" type=""button"">Wi-Fi 60ms</button>
       </div>
     </div>
     <div class=""ctrl"">
@@ -2003,7 +2121,7 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
   </div>
 
   <div class=""card tip"">
-    Dica: se notar picotes no áudio, aumente um pouco o <b>Buffer Alvo</b> (ex.: 45-65 ms no USB ou 90-120 ms no Wi-Fi). Em músicas/vídeos, deixe a tela bloquear normalmente se o sistema mantiver a guia em segundo plano.
+    Dica: no <b>Cabo USB</b> (15 ms), use <b>Túnel ADB</b> para ativar o <b>AudioWorklet (2,7 ms)</b> no Chrome. No Wi-Fi, 55–75 ms mantém estabilidade mesmo com oscilação do roteador. Lembre também que o próprio fone Bluetooth adiciona ~100–200 ms dependendo do codec/Modo Jogo do fone.
   </div>
 </div>
 
@@ -2034,6 +2152,15 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
   var ws = null;
   var ctx = null;
   var gainNode = null;
+  var silentInGain = null;
+  var audioNode = null;
+  var workletLoaded = false;
+  var workletLoading = false;
+  var useWorklet = false;
+  var engineLabel = 'Ring';
+  var dspFallback = null;
+  var pendingFrames = [];
+  var telemetryTimer = null;
   var keepAliveAudio = null;
   var wakeLock = null;
   var pingTimer = null;
@@ -2042,13 +2169,267 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
   var intentionalPause = false;
 
   var sampleRate = 48000;
-  var channels = 2;
-  var nextPlayTime = 0;
-  var targetBufferMs = initialMode === 'usb' ? 45 : 90;
-  var maxBufferMs = initialMode === 'usb' ? 140 : 230;
+  var targetBufferMs = initialMode === 'usb' ? 15 : 60;
+  var maxBufferMs = initialMode === 'usb' ? 55 : 160;
   var autoFollowPc = true;
-  var resyncCount = 0;
-  var smoothLevel = 0;
+
+  function createRingDspEngine(outRate) {
+    var CAP = 16384;
+    var MASK = 16383;
+    var ringL = new Float32Array(CAP);
+    var ringR = new Float32Array(CAP);
+    var srcRate = 48000;
+    var targetMs = 15;
+    var maxMs = 55;
+    var writePos = 0;
+    var readPos = 0;
+    var primed = false;
+    var avgAvail = 0;
+    var integral = 0;
+    var smoothedRate = srcRate / (outRate || 48000);
+    var plcMode = false;
+    var plcFrames = 0;
+    var plcAnchor = 0;
+    var plcStep = 1;
+    var plcGain = 1.0;
+    var fadeRem = 0;
+    var fadeTotal = 48;
+    var prevOutL = 0;
+    var prevOutR = 0;
+    var resyncCount = 0;
+    var plcEvents = 0;
+    var smoothLevel = 0;
+    var lastBufMs = 0;
+
+    function reset() {
+      writePos = 0;
+      readPos = 0;
+      primed = false;
+      avgAvail = 0;
+      integral = 0;
+      smoothedRate = srcRate / (outRate || 48000);
+      plcMode = false;
+      plcFrames = 0;
+      plcStep = 1;
+      plcGain = 1.0;
+      fadeRem = 0;
+      prevOutL = 0;
+      prevOutR = 0;
+      smoothLevel = 0;
+      lastBufMs = 0;
+    }
+
+    function setConfig(sr, tMs, mMs) {
+      if (sr && sr !== srcRate) {
+        srcRate = sr;
+        smoothedRate = srcRate / (outRate || 48000);
+      }
+      if (tMs) targetMs = tMs;
+      if (mMs) maxMs = mMs;
+    }
+
+    function setBufferTargets(tMs, mMs) {
+      if (tMs) targetMs = tMs;
+      if (mMs) maxMs = mMs;
+    }
+
+    function pushInt16Bytes(ab) {
+      if (!ab || ab.byteLength <= 8) return;
+      var frames = ((ab.byteLength - 8) / 4) | 0;
+      if (frames <= 0) return;
+      var i16 = new Int16Array(ab, 8, frames * 2);
+      var peak = 0;
+      var w = writePos;
+      for (var i = 0; i < frames; i++) {
+        var l = i16[i * 2] / 32768;
+        var r = i16[i * 2 + 1] / 32768;
+        var idx = w & MASK;
+        ringL[idx] = l;
+        ringR[idx] = r;
+        w++;
+        var a = l < 0 ? -l : l;
+        if (a > peak) peak = a;
+      }
+      writePos = w;
+      smoothLevel = smoothLevel * 0.65 + Math.min(1, peak * 1.4) * 0.35;
+
+      var targetFrames = Math.max(128, Math.round((targetMs * srcRate) / 1000));
+      if (!primed) {
+        if ((writePos - Math.floor(readPos)) >= targetFrames) {
+          primed = true;
+          readPos = writePos - targetFrames;
+          avgAvail = targetFrames;
+          integral = 0;
+          smoothedRate = srcRate / (outRate || 48000);
+          fadeRem = fadeTotal;
+          prevOutL = 0;
+          prevOutR = 0;
+        }
+      } else if ((writePos - readPos) > (CAP - 1024)) {
+        readPos = writePos - targetFrames;
+        fadeRem = fadeTotal;
+        avgAvail = targetFrames;
+        integral = 0;
+        resyncCount++;
+      }
+
+      if (readPos > 100000000 && writePos > 100000000) {
+        var shift = CAP * 1000;
+        readPos -= shift;
+        writePos -= shift;
+        plcAnchor -= shift;
+      }
+    }
+
+    function hermite(arr, idxInt, f) {
+      var y0 = arr[(idxInt - 1) & MASK];
+      var y1 = arr[idxInt & MASK];
+      var y2 = arr[(idxInt + 1) & MASK];
+      var y3 = arr[(idxInt + 2) & MASK];
+      var c0 = y1;
+      var c1 = 0.5 * (y2 - y0);
+      var c2 = y0 - 2.5 * y1 + 2.0 * y2 - 0.5 * y3;
+      var c3 = 0.5 * (y3 - y0) + 1.5 * (y1 - y2);
+      return ((c3 * f + c2) * f + c1) * f + c0;
+    }
+
+    function renderBlock(outL, outR) {
+      var n = outL.length;
+      if (!primed) {
+        for (var z = 0; z < n; z++) {
+          outL[z] = 0;
+          if (outR !== outL) outR[z] = 0;
+        }
+        lastBufMs = Math.round((Math.max(0, writePos - readPos) * 1000) / srcRate);
+        return;
+      }
+
+      var targetFrames = Math.max(96, (targetMs * srcRate) / 1000);
+      var maxFrames = Math.max((maxMs * srcRate) / 1000, targetFrames + (srcRate * 0.025));
+      var availNow = writePos - readPos;
+      if (availNow > maxFrames) {
+        readPos = writePos - targetFrames;
+        fadeRem = fadeTotal;
+        avgAvail = targetFrames;
+        integral = 0;
+        resyncCount++;
+        availNow = targetFrames;
+      }
+
+      var avail = Math.max(0, availNow);
+      avgAvail = avgAvail * 0.94 + avail * 0.06;
+      var dt = n / (outRate || 48000);
+      var errSec = (avgAvail - targetFrames) / srcRate;
+      integral += errSec * dt;
+      if (integral > 0.02) integral = 0.02;
+      if (integral < -0.02) integral = -0.02;
+
+      var corr = errSec * 0.45 + integral * 0.12;
+      if (corr > 0.014) corr = 0.014;
+      if (corr < -0.014) corr = -0.014;
+
+      var targetRate = (srcRate / (outRate || 48000)) * (1.0 + corr);
+      smoothedRate = smoothedRate * 0.88 + targetRate * 0.12;
+
+      var maxPlcDecayFrames = Math.round(srcRate * 0.028);
+      var maxPlcResetFrames = Math.round(srcRate * 0.045);
+
+      for (var i = 0; i < n; i++) {
+        if (readPos + 1.0 < writePos) {
+          if (plcMode) {
+            plcMode = false;
+            plcFrames = 0;
+            fadeRem = 32;
+          }
+          var idx = Math.floor(readPos);
+          var frac = readPos - idx;
+          var sL;
+          var sR;
+          if (idx + 2 < writePos) {
+            sL = hermite(ringL, idx, frac);
+            sR = hermite(ringR, idx, frac);
+          } else {
+            var i0 = idx & MASK;
+            var i1 = (idx + 1) & MASK;
+            sL = ringL[i0] + (ringL[i1] - ringL[i0]) * frac;
+            sR = ringR[i0] + (ringR[i1] - ringR[i0]) * frac;
+          }
+          if (fadeRem > 0) {
+            var w = (fadeTotal - fadeRem) / fadeTotal;
+            if (w < 0) w = 0;
+            if (w > 1) w = 1;
+            sL = prevOutL * (1.0 - w) + sL * w;
+            sR = prevOutR * (1.0 - w) + sR * w;
+            fadeRem--;
+          }
+          outL[i] = sL;
+          if (outR !== outL) outR[i] = sR;
+          prevOutL = sL;
+          prevOutR = sR;
+          readPos += smoothedRate;
+        } else {
+          if (!plcMode) {
+            plcMode = true;
+            plcFrames = 0;
+            plcAnchor = Math.max(0, writePos - 1);
+            plcStep = 1;
+            plcGain = 1.0;
+            plcEvents++;
+          }
+          plcFrames++;
+          if (plcFrames > maxPlcResetFrames) {
+            primed = false;
+            plcMode = false;
+            readPos = writePos;
+            resyncCount++;
+            for (var k = i; k < n; k++) {
+              prevOutL *= 0.9;
+              prevOutR *= 0.9;
+              outL[k] = prevOutL;
+              if (outR !== outL) outR[k] = prevOutR;
+            }
+            break;
+          } else if (plcFrames > maxPlcDecayFrames) {
+            prevOutL *= 0.92;
+            prevOutR *= 0.92;
+            outL[i] = prevOutL;
+            if (outR !== outL) outR[i] = prevOutR;
+          } else {
+            var mIdx = (plcAnchor - plcStep) & MASK;
+            plcStep++;
+            if (plcStep >= 160) plcStep = 1;
+            plcGain *= 0.993;
+            var mL = ringL[mIdx] * plcGain;
+            var mR = ringR[mIdx] * plcGain;
+            outL[i] = mL;
+            if (outR !== outL) outR[i] = mR;
+            prevOutL = mL;
+            prevOutR = mR;
+          }
+        }
+      }
+
+      lastBufMs = Math.max(0, Math.round(((writePos - readPos) * 1000) / srcRate));
+    }
+
+    function getTelemetry() {
+      return {
+        bufMs: lastBufMs,
+        resyncs: resyncCount,
+        plc: plcEvents,
+        level: smoothLevel
+      };
+    }
+
+    return {
+      reset: reset,
+      setConfig: setConfig,
+      setBufferTargets: setBufferTargets,
+      pushInt16Bytes: pushInt16Bytes,
+      renderBlock: renderBlock,
+      getTelemetry: getTelemetry
+    };
+  }
 
   function applyModeBadge(mode) {
     if (mode === 'usb') {
@@ -2062,17 +2443,22 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
 
   function updateBufferUi(ms, customMax) {
     targetBufferMs = ms;
-    maxBufferMs = customMax ? customMax : Math.max(ms * 2 + 40, ms + 80);
+    maxBufferMs = customMax ? customMax : Math.max(ms * 2 + 25, ms + 40);
     bufSlider.value = String(ms);
     bufLbl.textContent = ms + ' ms';
     for (var i = 0; i < chips.length; i++) {
       var cms = parseInt(chips[i].getAttribute('data-ms'), 10);
       chips[i].className = cms === ms ? 'chip active' : 'chip';
     }
+    if (useWorklet && audioNode && audioNode.port) {
+      audioNode.port.postMessage({ type: 'buf', targetMs: targetBufferMs, maxMs: maxBufferMs });
+    } else if (dspFallback) {
+      dspFallback.setBufferTargets(targetBufferMs, maxBufferMs);
+    }
   }
 
   applyModeBadge(initialMode);
-  updateBufferUi(targetBufferMs);
+  updateBufferUi(targetBufferMs, maxBufferMs);
 
   function setStatus(state, text, sub) {
     dot.className = 'dot ' + state;
@@ -2099,6 +2485,17 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
     try { if (keepAliveAudio) keepAliveAudio.pause(); } catch (e) {}
   }
 
+  function updateFormatLabel() {
+    fmtStat.textContent = (Math.round(sampleRate / 100) / 10) + 'kHz · ' + engineLabel;
+  }
+
+  function applyTelemetry(t) {
+    if (!t) return;
+    bufStat.textContent = t.bufMs + ' ms';
+    dropStat.textContent = String(t.resyncs) + (t.plc > 0 ? ' (PLC ' + t.plc + ')' : '');
+    meterFill.style.width = Math.round(Math.min(1, t.level) * 100) + '%';
+  }
+
   function disconnectSession(state, title, sub) {
     if (!running && !ws) {
       setStatus(state, title, sub);
@@ -2106,7 +2503,9 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
     }
     running = false;
     wasAudioRunning = false;
+    pendingFrames = [];
     if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
+    if (telemetryTimer) { clearInterval(telemetryTimer); telemetryTimer = null; }
     if (ws) {
       try {
         ws.onopen = null;
@@ -2116,6 +2515,14 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
         ws.close();
       } catch (e) {}
       ws = null;
+    }
+    if (useWorklet && audioNode && audioNode.port) {
+      try { audioNode.port.postMessage({ type: 'stop' }); } catch (e) {}
+    } else if (dspFallback) {
+      dspFallback.reset();
+    }
+    if (ctx && ctx.state === 'running') {
+      try { ctx.suspend(); } catch (e) {}
     }
     stopKeepAlive();
     if (wakeLock) {
@@ -2160,7 +2567,126 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
     } catch (e) {}
   }
 
-  function ensureAudioContext() {
+  function initScriptProcessorEngine() {
+    if (audioNode && !useWorklet && dspFallback) {
+      dspFallback.reset();
+      dspFallback.setConfig(sampleRate, targetBufferMs, maxBufferMs);
+      startScriptTelemetry();
+      flushPendingFrames();
+      return;
+    }
+    dspFallback = createRingDspEngine(ctx.sampleRate);
+    dspFallback.setConfig(sampleRate, targetBufferMs, maxBufferMs);
+    var sizes = initialMode === 'usb' ? [256, 512, 1024] : [512, 1024];
+    var sp = null;
+    var chosenSize = 512;
+    for (var i = 0; i < sizes.length; i++) {
+      try {
+        sp = ctx.createScriptProcessor(sizes[i], 1, 2);
+        chosenSize = sizes[i];
+        break;
+      } catch (e) {}
+    }
+    if (!sp) return;
+    if (!silentInGain) {
+      silentInGain = ctx.createGain();
+      silentInGain.gain.value = 0;
+    }
+    sp.onaudioprocess = function(ev) {
+      var outL = ev.outputBuffer.getChannelData(0);
+      var outR = ev.outputBuffer.getChannelData(1);
+      if (!running) {
+        outL.fill(0);
+        outR.fill(0);
+        return;
+      }
+      dspFallback.renderBlock(outL, outR);
+    };
+    silentInGain.connect(sp);
+    sp.connect(gainNode);
+    audioNode = sp;
+    useWorklet = false;
+    engineLabel = 'Ring ' + (Math.round((chosenSize * 10000) / ctx.sampleRate) / 10) + 'ms';
+    updateFormatLabel();
+    startScriptTelemetry();
+    flushPendingFrames();
+  }
+
+  function startScriptTelemetry() {
+    if (telemetryTimer) clearInterval(telemetryTimer);
+    telemetryTimer = setInterval(function() {
+      if (running && !useWorklet && dspFallback) {
+        applyTelemetry(dspFallback.getTelemetry());
+      }
+    }, 110);
+  }
+
+  function flushPendingFrames() {
+    if (!running || pendingFrames.length === 0) return;
+    for (var i = 0; i < pendingFrames.length; i++) {
+      dispatchAudioFrame(pendingFrames[i]);
+    }
+    pendingFrames = [];
+  }
+
+  function dispatchAudioFrame(ab) {
+    if (useWorklet && workletLoaded && audioNode && audioNode.port) {
+      audioNode.port.postMessage(ab, [ab]);
+    } else if (!useWorklet && dspFallback) {
+      dspFallback.pushInt16Bytes(ab);
+    } else {
+      if (pendingFrames.length < 16) pendingFrames.push(ab);
+    }
+  }
+
+  function buildWorkletCode() {
+    return 'var createRingDspEngine = ' + createRingDspEngine.toString() + ';\n' +
+      'class PhoneAudioBridgeWorklet extends AudioWorkletProcessor {\n' +
+      '  constructor() {\n' +
+      '    super();\n' +
+      '    this.dsp = createRingDspEngine(sampleRate);\n' +
+      '    this.active = false;\n' +
+      '    this.tick = 0;\n' +
+      '    var self = this;\n' +
+      '    this.port.onmessage = function(ev) {\n' +
+      '      var d = ev.data;\n' +
+      '      if (d instanceof ArrayBuffer) {\n' +
+      '        if (self.active) self.dsp.pushInt16Bytes(d);\n' +
+      '      } else if (d && d.type === \'cfg\') {\n' +
+      '        self.dsp.setConfig(d.sampleRate, d.targetMs, d.maxMs);\n' +
+      '      } else if (d && d.type === \'buf\') {\n' +
+      '        self.dsp.setBufferTargets(d.targetMs, d.maxMs);\n' +
+      '      } else if (d && d.type === \'start\') {\n' +
+      '        self.dsp.reset();\n' +
+      '        self.active = true;\n' +
+      '      } else if (d && d.type === \'stop\') {\n' +
+      '        self.active = false;\n' +
+      '        self.dsp.reset();\n' +
+      '      }\n' +
+      '    };\n' +
+      '  }\n' +
+      '  process(inputs, outputs) {\n' +
+      '    var out = outputs[0];\n' +
+      '    if (!out || out.length === 0) return true;\n' +
+      '    var outL = out[0];\n' +
+      '    var outR = out.length > 1 ? out[1] : null;\n' +
+      '    if (!this.active) {\n' +
+      '      outL.fill(0);\n' +
+      '      if (outR) outR.fill(0);\n' +
+      '      return true;\n' +
+      '    }\n' +
+      '    this.dsp.renderBlock(outL, outR || outL);\n' +
+      '    if (++this.tick >= 36) {\n' +
+      '      this.tick = 0;\n' +
+      '      this.port.postMessage(this.dsp.getTelemetry());\n' +
+      '    }\n' +
+      '    return true;\n' +
+      '  }\n' +
+      '}\n' +
+      'registerProcessor(\'phone-audio-bridge-proc\', PhoneAudioBridgeWorklet);\n';
+  }
+
+  function ensureAudioContextAndEngine() {
     var AC = window.AudioContext || window.webkitAudioContext;
     if (!ctx) {
       try {
@@ -2180,6 +2706,7 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
         }
       };
     }
+
     wasAudioRunning = (ctx.state === 'running');
     if (ctx.state !== 'running') {
       try {
@@ -2191,71 +2718,45 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
         }
       } catch (e) {}
     }
-    nextPlayTime = ctx.currentTime + (targetBufferMs / 1000);
-  }
 
-  function schedulePcmFrame(arrayBuffer) {
-    if (!ctx || !running) return;
-    if (arrayBuffer.byteLength <= 8) return;
-
-    var pcmBytes = arrayBuffer.byteLength - 8;
-    var frames = (pcmBytes / 4) | 0;
-    if (frames <= 0) return;
-
-    var i16 = new Int16Array(arrayBuffer, 8, frames * 2);
-    var abuf = ctx.createBuffer(2, frames, sampleRate);
-    var ch0 = abuf.getChannelData(0);
-    var ch1 = abuf.getChannelData(1);
-
-    var peak = 0;
-    for (var i = 0; i < frames; i++) {
-      var l = i16[i * 2] / 32768;
-      var r = i16[i * 2 + 1] / 32768;
-      ch0[i] = l;
-      ch1[i] = r;
-      var a = l < 0 ? -l : l;
-      if (a > peak) peak = a;
-    }
-
-    smoothLevel = smoothLevel * 0.65 + Math.min(1, peak * 1.4) * 0.35;
-    meterFill.style.width = Math.round(smoothLevel * 100) + '%';
-
-    var now = ctx.currentTime;
-    var targetSec = targetBufferMs / 1000;
-    var maxSec = maxBufferMs / 1000;
-    var queued = nextPlayTime - now;
-
-    if (queued < 0.008) {
-      nextPlayTime = now + targetSec;
-      var fadeSamples = Math.min(frames, Math.round(sampleRate * 0.003));
-      for (var f = 0; f < fadeSamples; f++) {
-        var g = f / fadeSamples;
-        ch0[f] *= g;
-        ch1[f] *= g;
+    if (window.isSecureContext && ctx.audioWorklet) {
+      if (workletLoaded && audioNode) {
+        useWorklet = true;
+        audioNode.port.postMessage({ type: 'cfg', sampleRate: sampleRate, targetMs: targetBufferMs, maxMs: maxBufferMs });
+        audioNode.port.postMessage({ type: 'start' });
+        flushPendingFrames();
+        return;
       }
-      resyncCount++;
-      dropStat.textContent = String(resyncCount);
-    } else if (queued > maxSec) {
-      resyncCount++;
-      dropStat.textContent = String(resyncCount);
-      bufStat.textContent = Math.max(0, Math.round(queued * 1000)) + ' ms';
-      return;
+      if (!workletLoading) {
+        workletLoading = true;
+        useWorklet = true;
+        engineLabel = 'Worklet 2.7ms';
+        updateFormatLabel();
+        var blobUrl = URL.createObjectURL(new Blob([buildWorkletCode()], { type: 'application/javascript' }));
+        ctx.audioWorklet.addModule(blobUrl).then(function() {
+          URL.revokeObjectURL(blobUrl);
+          workletLoading = false;
+          workletLoaded = true;
+          audioNode = new AudioWorkletNode(ctx, 'phone-audio-bridge-proc', { numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [2] });
+          audioNode.port.onmessage = function(ev) {
+            if (running) applyTelemetry(ev.data);
+          };
+          audioNode.connect(gainNode);
+          audioNode.port.postMessage({ type: 'cfg', sampleRate: sampleRate, targetMs: targetBufferMs, maxMs: maxBufferMs });
+          if (running) {
+            audioNode.port.postMessage({ type: 'start' });
+            flushPendingFrames();
+          }
+        }).catch(function() {
+          URL.revokeObjectURL(blobUrl);
+          workletLoading = false;
+          useWorklet = false;
+          initScriptProcessorEngine();
+        });
+      }
+    } else {
+      initScriptProcessorEngine();
     }
-
-    queued = nextPlayTime - now;
-    var err = queued - targetSec;
-    var rate = 1.0 + err * 0.35;
-    if (rate > 1.010) rate = 1.010;
-    if (rate < 0.990) rate = 0.990;
-
-    var src = ctx.createBufferSource();
-    src.buffer = abuf;
-    src.playbackRate.value = rate;
-    src.connect(gainNode);
-    src.start(nextPlayTime);
-
-    nextPlayTime += abuf.duration / rate;
-    bufStat.textContent = Math.max(0, Math.round((nextPlayTime - now) * 1000)) + ' ms';
   }
 
   function connectWs() {
@@ -2272,7 +2773,6 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
 
     ws.onopen = function() {
       setStatus('live', 'Conectado e recebendo áudio', 'Áudio pronto — toque algo no PC para ouvir');
-      nextPlayTime = ctx.currentTime + (targetBufferMs / 1000);
       if (pingTimer) clearInterval(pingTimer);
       pingTimer = setInterval(function(){
         if (ws && ws.readyState === 1) {
@@ -2290,17 +2790,22 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
             rttStat.textContent = Math.max(1, Math.round(performance.now() - msg.t)) + ' ms';
           } else if (msg.type === 'config') {
             if (msg.sampleRate) sampleRate = msg.sampleRate;
-            fmtStat.textContent = Math.round(sampleRate / 100) / 10 + 'kHz Estéreo';
+            updateFormatLabel();
             if (msg.device) deviceText.textContent = 'Fonte PC: ' + msg.device;
             var tr = msg.transport || msg.mode;
             if (tr) applyModeBadge(tr);
             if (autoFollowPc && msg.targetBufferMs) {
               updateBufferUi(msg.targetBufferMs, msg.maxBufferMs);
             }
+            if (useWorklet && workletLoaded && audioNode && audioNode.port) {
+              audioNode.port.postMessage({ type: 'cfg', sampleRate: sampleRate, targetMs: targetBufferMs, maxMs: maxBufferMs });
+            } else if (dspFallback) {
+              dspFallback.setConfig(sampleRate, targetBufferMs, maxBufferMs);
+            }
           }
         } catch (e) {}
       } else if (ev.data instanceof ArrayBuffer) {
-        schedulePcmFrame(ev.data);
+        dispatchAudioFrame(ev.data);
       }
     };
 
@@ -2320,11 +2825,11 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
   playBtn.addEventListener('click', function() {
     if (!running) {
       running = true;
-      resyncCount = 0;
+      pendingFrames = [];
       dropStat.textContent = '0';
       playBtn.textContent = 'Desconectar';
       playBtn.className = 'btn-main stop';
-      ensureAudioContext();
+      ensureAudioContextAndEngine();
       startKeepAlive();
       connectWs();
     } else {
@@ -2405,7 +2910,7 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
         private readonly object _queueLock = new object();
         private readonly Action<WsClientSession> _onDisconnect;
         private volatile bool _closed;
-        private int _maxQueueSize = 20;
+        private int _maxQueueSize = 24;
 
         public readonly string LocalIp;
         public readonly bool IsUsbTransport;
@@ -2429,7 +2934,7 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
         {
             var writer = new Thread(WriterLoop);
             writer.IsBackground = true;
-            writer.Priority = ThreadPriority.AboveNormal;
+            writer.Priority = ThreadPriority.Highest;
             writer.Name = "WS-Writer";
             writer.Start();
 
@@ -2451,9 +2956,8 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
             _signal.Set();
         }
 
-        public void EnqueueBinaryAudio(byte[] packetWithHeader)
+        public void EnqueuePrebuiltAudioFrame(byte[] wsFrame)
         {
-            byte[] frame = BuildFrame(0x82, packetWithHeader);
             lock (_queueLock)
             {
                 if (_closed) return;
@@ -2461,7 +2965,7 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
                 {
                     _sendQueue.Dequeue();
                 }
-                _sendQueue.Enqueue(frame);
+                _sendQueue.Enqueue(wsFrame);
             }
             _signal.Set();
         }
@@ -2515,6 +3019,16 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
 
         private void WriterLoop()
         {
+            IntPtr mmcssHandle = IntPtr.Zero;
+            try
+            {
+                uint taskIdx = 0;
+                mmcssHandle = NativeWin32.AvSetMmThreadCharacteristicsW("Pro Audio", ref taskIdx);
+            }
+            catch
+            {
+            }
+
             try
             {
                 while (!_closed)
@@ -2540,6 +3054,10 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
             }
             finally
             {
+                if (mmcssHandle != IntPtr.Zero)
+                {
+                    try { NativeWin32.AvRevertMmThreadCharacteristics(mmcssHandle); } catch { }
+                }
                 Dispose();
             }
         }
@@ -2664,8 +3182,8 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
         public volatile string Mode = "wifi";
         public volatile int SampleRate = 48000;
         public volatile int ChunkMs = 20;
-        public volatile int TargetBufferMs = 90;
-        public volatile int MaxBufferMs = 230;
+        public volatile int TargetBufferMs = 60;
+        public volatile int MaxBufferMs = 160;
         public volatile string DeviceName = "Padrão do Windows";
         public volatile bool UsbDetected;
         public volatile bool AdbActive;
@@ -2754,16 +3272,16 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
             if (isUsbTransport)
             {
                 transport = "usb";
-                targetMs = 45;
-                maxMs = 140;
-                qLimit = 16;
+                targetMs = 15;
+                maxMs = 55;
+                qLimit = 24;
             }
             else
             {
                 transport = "wifi";
-                targetMs = 90;
-                maxMs = 230;
-                qLimit = 20;
+                targetMs = 60;
+                maxMs = 160;
+                qLimit = 24;
             }
         }
 
@@ -2784,9 +3302,9 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
             bool isUsb = (mode == BridgeMode.Usb);
             Mode = isUsb ? "usb" : "wifi";
             SampleRate = sampleRate > 0 ? sampleRate : 48000;
-            ChunkMs = isUsb ? 15 : 20;
-            TargetBufferMs = isUsb ? 45 : 90;
-            MaxBufferMs = isUsb ? 140 : 230;
+            ChunkMs = isUsb ? 10 : 20;
+            TargetBufferMs = isUsb ? 15 : 60;
+            MaxBufferMs = isUsb ? 55 : 160;
             DeviceName = string.IsNullOrEmpty(deviceName) ? "Padrão do Windows" : deviceName;
 
             lock (_clientsLock)
@@ -2812,20 +3330,43 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
 
                 uint seq = ++_seqCounter;
                 uint tick = unchecked((uint)Environment.TickCount);
-                byte[] pkt = new byte[8 + pcm16Stereo.Length];
-                pkt[0] = (byte)(seq & 0xFF);
-                pkt[1] = (byte)((seq >> 8) & 0xFF);
-                pkt[2] = (byte)((seq >> 16) & 0xFF);
-                pkt[3] = (byte)((seq >> 24) & 0xFF);
-                pkt[4] = (byte)(tick & 0xFF);
-                pkt[5] = (byte)((tick >> 8) & 0xFF);
-                pkt[6] = (byte)((tick >> 16) & 0xFF);
-                pkt[7] = (byte)((tick >> 24) & 0xFF);
-                Buffer.BlockCopy(pcm16Stereo, 0, pkt, 8, pcm16Stereo.Length);
+                int payloadLen = 8 + pcm16Stereo.Length;
+                int wsHdrLen = payloadLen <= 125 ? 2 : (payloadLen <= 65535 ? 4 : 10);
+                byte[] wsFrame = new byte[wsHdrLen + payloadLen];
+                wsFrame[0] = 0x82;
+                if (payloadLen <= 125)
+                {
+                    wsFrame[1] = (byte)payloadLen;
+                }
+                else if (payloadLen <= 65535)
+                {
+                    wsFrame[1] = 126;
+                    wsFrame[2] = (byte)((payloadLen >> 8) & 0xFF);
+                    wsFrame[3] = (byte)(payloadLen & 0xFF);
+                }
+                else
+                {
+                    wsFrame[1] = 127;
+                    long l64 = payloadLen;
+                    for (int k = 0; k < 8; k++)
+                    {
+                        wsFrame[2 + k] = (byte)((l64 >> ((7 - k) * 8)) & 0xFF);
+                    }
+                }
+
+                wsFrame[wsHdrLen] = (byte)(seq & 0xFF);
+                wsFrame[wsHdrLen + 1] = (byte)((seq >> 8) & 0xFF);
+                wsFrame[wsHdrLen + 2] = (byte)((seq >> 16) & 0xFF);
+                wsFrame[wsHdrLen + 3] = (byte)((seq >> 24) & 0xFF);
+                wsFrame[wsHdrLen + 4] = (byte)(tick & 0xFF);
+                wsFrame[wsHdrLen + 5] = (byte)((tick >> 8) & 0xFF);
+                wsFrame[wsHdrLen + 6] = (byte)((tick >> 16) & 0xFF);
+                wsFrame[wsHdrLen + 7] = (byte)((tick >> 24) & 0xFF);
+                Buffer.BlockCopy(pcm16Stereo, 0, wsFrame, wsHdrLen + 8, pcm16Stereo.Length);
 
                 for (int i = 0; i < _clients.Count; i++)
                 {
-                    _clients[i].EnqueueBinaryAudio(pkt);
+                    _clients[i].EnqueuePrebuiltAudioFrame(wsFrame);
                 }
             }
         }
@@ -3125,7 +3666,7 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
         private Label _lblQrHint;
         private System.Windows.Forms.Timer _uiTimer;
 
-        public MainBridgeForm()
+        public MainBridgeForm(BridgeMode initialMode)
         {
             _capture = new WasapiLoopbackCapture();
             _server = new AudioWebServer(DefaultPort);
@@ -3167,7 +3708,7 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
 
             RefreshAudioDevices();
             RefreshAdbAndNetwork(true);
-            SetMode(BridgeMode.Wifi);
+            SetMode(initialMode);
 
             _server.Start();
             _capture.Start();
@@ -3233,7 +3774,7 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
 
             _btnWifi = new Button
             {
-                Text = "Wi-Fi / Rede Local\r\nSem cabos (~90 ms)",
+                Text = "Wi-Fi / Rede Local\r\nSem cabos (~60 ms)",
                 Location = new Point(lx, 100),
                 Size = new Size(198, 52),
                 FlatStyle = FlatStyle.Flat,
@@ -3245,7 +3786,7 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
 
             _btnUsb = new Button
             {
-                Text = "Cabo USB (Menor Delay)\r\nMais estável (~45 ms)",
+                Text = "Cabo USB (Menor Delay)\r\nUltra-baixo (10–15 ms)",
                 Location = new Point(lx + 210, 100),
                 Size = new Size(198, 52),
                 FlatStyle = FlatStyle.Flat,
@@ -3476,7 +4017,7 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
             if (_miModeWifi != null) _miModeWifi.Checked = !isUsb;
             if (_miModeUsb != null) _miModeUsb.Checked = isUsb;
 
-            _capture.SetModeChunkMs(isUsb ? 15 : 20);
+            _capture.SetModeChunkMs(isUsb ? 10 : 20);
             _server.UpdateProfile(mode, _capture.CurrentSampleRate, _capture.ActiveDeviceName);
 
             SelectPreferredNetworkForMode();
@@ -3690,11 +4231,11 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
 
             if (_mode == BridgeMode.Usb)
             {
-                _lblQrHint.Text = "Perfil Cabo USB: blocos de 15 ms · buffer 45 ms.\r\nSe o link usar 192.168.x.x, libere o Firewall abaixo.";
+                _lblQrHint.Text = "Perfil Cabo USB: blocos 10 ms · buffer 15 ms (Ring/Worklet).\r\nUse Túnel ADB para AudioWorklet 2,7 ms sem jitter.";
             }
             else
             {
-                _lblQrHint.Text = "Perfil Wi-Fi: blocos de 20 ms · buffer 90 ms.\r\nEscaneie com a câmera do celular ou digite o link acima.";
+                _lblQrHint.Text = "Perfil Wi-Fi: blocos 20 ms · buffer 60 ms.\r\nEscaneie com a câmera do celular ou digite o link acima.";
             }
         }
 
@@ -3744,10 +4285,11 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
             }
 
             _netTickDivider++;
-            if (_netTickDivider >= 25)
+            int netInterval = clients > 0 ? 80 : 25;
+            if (_netTickDivider >= netInterval)
             {
                 _netTickDivider = 0;
-                RefreshAdbAndNetwork(_mode == BridgeMode.Usb);
+                RefreshAdbAndNetwork(_mode == BridgeMode.Usb && clients == 0);
             }
         }
 
@@ -4018,11 +4560,16 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
 
                 // Test GET /
                 string htmlResp = HttpGetText("127.0.0.1", port, "/?mode=usb");
-                bool htmlValid = htmlResp.Contains("200 OK") && htmlResp.Contains("WebSocket") && htmlResp.Contains("AudioContext");
+                bool htmlValid = htmlResp.Contains("200 OK") &&
+                    htmlResp.Contains("AudioWorklet") &&
+                    htmlResp.Contains("ringL") &&
+                    htmlResp.Contains("disconnectSession") &&
+                    !htmlResp.Contains("reconnectTimer") &&
+                    !htmlResp.Contains("resumeBtn");
 
                 // Test GET /api/info
                 string infoResp = HttpGetText("127.0.0.1", port, "/api/info");
-                bool infoValid = infoResp.Contains("200 OK") && infoResp.Contains("\"mode\":\"usb\"") && infoResp.Contains("\"chunkMs\":15") && infoResp.Contains("\"targetBufferMs\":45");
+                bool infoValid = infoResp.Contains("200 OK") && infoResp.Contains("\"mode\":\"usb\"") && infoResp.Contains("\"chunkMs\":10") && infoResp.Contains("\"targetBufferMs\":15");
 
                 // Test WebSocket upgrade + config + ping->pong
                 bool wsValid = TestWebSocketHandshakeAndPing("127.0.0.1", port, out serverDetails);
@@ -4180,6 +4727,18 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
                 return SelfTestRunner.Run(args);
             }
 
+            BridgeMode startMode = BridgeMode.Wifi;
+            if (args != null)
+            {
+                for (int i = 0; i < args.Length; i++)
+                {
+                    if (string.Equals(args[i], "--usb", StringComparison.OrdinalIgnoreCase))
+                    {
+                        startMode = BridgeMode.Usb;
+                    }
+                }
+            }
+
             bool createdNew;
             using (var mutex = new Mutex(true, "Local\\PhoneAudioBridge_SingleInstance", out createdNew))
             {
@@ -4195,7 +4754,7 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
 
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
-                Application.Run(new MainBridgeForm());
+                Application.Run(new MainBridgeForm(startMode));
                 return 0;
             }
         }

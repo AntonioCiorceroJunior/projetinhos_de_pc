@@ -18,11 +18,11 @@ Muitos PCs de mesa não têm placa Bluetooth embutida (ou têm receptores USB 2.
 
 * **QR Code gerado na hora (100% offline/nativo):** Escaneie com a câmera do celular para abrir o player direto no navegador (Chrome/Safari), sem instalar app no celular.
 * **Dois modos otimizados de transmissão:**
-  * **Modo Wi-Fi / Rede Local (~90 ms de buffer):** Prático e sem fios, usando pacotes de 20 ms via WebSocket.
-  * **Modo Cabo USB (~45 ms de buffer):** Reduz drasticamente o *jitter* e o delay usando blocos de **15 ms**, com suporte automático a:
+  * **Modo Wi-Fi / Rede Local (~60 ms de buffer):** Prático e sem fios, usando pacotes de 20 ms via WebSocket.
+  * **Modo Cabo USB (~15 ms de buffer / 10 ms por bloco):** Alinhado 1:1 ao período nativo de 10 ms do WASAPI (480 frames a 48 kHz) com suporte automático a:
     1. **Ancoragem USB (*USB Tethering*):** Detecta automaticamente a placa de rede USB RNDIS/Apple/Android e troca o QR Code para o IP do cabo assim que a ancoragem é ativada.
-    2. **Túnel ADB (bônus para Android):** Se `adb.exe` estiver disponível no PC e a Depuração USB estiver ativa, cria `adb reverse tcp:8765 tcp:8765` automaticamente (`http://127.0.0.1:8765/?mode=usb`), dispensando Ancoragem USB e passando direto sem bloqueio de firewall.
-* **Player Mobile com Controle Adaptativo de Drift (micro-PLL) & Desconexão Limpa:** Ajusta suavemente a taxa de reprodução (`0.990x` a `1.010x`) para evitar acúmulo de atraso e evitar estalos/cortes, e **encerra a sessão automaticamente** se o Bluetooth/áudio do celular for desligado — sem reconectar sozinho depois.
+    2. **Túnel ADB (recomendado para 10–15 ms liso no Android):** Se `adb.exe` estiver disponível no PC e a Depuração USB estiver ativa, cria `adb reverse tcp:8765 tcp:8765` automaticamente (`http://127.0.0.1:8765/?mode=usb`), liberando `AudioWorklet` em contexto seguro e dispensando firewall.
+* **Motor Ring-Buffer Contínuo (ASRC PI + Hermite + PLC) & Desconexão Limpa:** Substitui agendamentos fragmentados por um ring buffer pré-alocado (`16384` frames) com compensação contínua de *clock drift* via controlador PI, interpolação cúbica de Hermite, ocultação suave de micro-perdas (*PLC* por espelhamento) e **desconexão definitiva** se o Bluetooth/áudio do celular for desligado — sem reconectar sozinho depois.
 * **Seleção de dispositivo de saída & medidor de nível ao vivo:** Captura o dispositivo padrão do Windows ou uma saída específica, com barra VU em tempo real e alerta visual de conexão.
 * **Bandeja do Sistema (`^`):** Permite ocultar na área de notificação, alternar entre modos Wi-Fi/USB e marcar **"Iniciar com o Windows"**.
 
@@ -32,10 +32,28 @@ Muitos PCs de mesa não têm placa Bluetooth embutida (ou têm receptores USB 2.
 
 | Camada | Implementação / Tecnologia |
 | :--- | :--- |
-| **Captura de Áudio (Windows)** | **WASAPI Loopback** via **COM Interop puro** (`IMMDeviceEnumerator`, `IAudioClient`, `IAudioCaptureClient`) em thread dedicada com `timeBeginPeriod(1)`, convertendo Float32/PCM/multicanal para PCM Int16 estéreo sem bibliotecas externas. |
-| **Servidor HTTP + WebSocket** | Servidor **TCP / HTTP / WebSocket (RFC 6455)** puro sobre `TcpListener` com `NoDelay = true` e fila limitada por cliente (3–4 pacotes) para nunca acumular atraso se a rede oscilar. |
+| **Captura de Áudio (Windows)** | **WASAPI Loopback Event-Driven** (`AUDCLNT_STREAMFLAGS_LOOPBACK \| EVENTCALLBACK`) + **MMCSS `"Pro Audio"`** (`avrt.dll`) + `timeBeginPeriod(1)`, com caminho rápido direto para blocos de **10 ms** (480 frames) e fallback automático para polling. |
+| **Servidor HTTP + WebSocket** | Servidor **TCP / HTTP / WebSocket (RFC 6455)** puro sobre `TcpListener` com `NoDelay = true`, thread `WS-Writer` elevada via MMCSS `"Pro Audio"`, frame binário único pré-montado (zero cópia por cliente) e fila anti-drop de 24 pacotes. |
 | **Gerador de QR Code** | Codificador **ISO/IEC 18004 (Versões 1–5, Nível M)** escrito do zero em C# com aritmética GF(256), Reed-Solomon, seleção de máscara de menor penalidade e renderização GDI+ nítida. |
-| **Player no Navegador** | **HTML5 + Web Audio API** (`AudioContext` com `latencyHint: 'interactive'`), slider de buffer manual (`15–150 ms`), volume (`0–150%`), medição real de ping RTT, `MediaSession` keepalive e `WakeLock`. |
+| **Player no Navegador** | **Ring-Buffer Contínuo** em **`AudioWorklet` (2,7 ms / 128 samples)** quando em contexto seguro (`127.0.0.1` via ADB) ou **`ScriptProcessorNode(256)` (`5,3 ms`)** em HTTP local; controlador **PI**, **interpolação cúbica de Hermite**, **PLC por espelhamento** de onda, slider `10–180 ms`, presets (`10 / 15 / 60 ms`), `MediaSession` e `WakeLock`. |
+
+---
+
+## Engenharia de Baixa Latência (10–15 ms) e Referências
+
+Para manter o áudio liso em **10–15 ms** sem picotes mesmo no navegador do celular, o projeto combina técnicas usadas em áudio profissional e streaming em tempo real:
+
+1. **Alinhamento 1:1 com o motor WASAPI do Windows (`10 ms`) + Event-Driven + MMCSS `"Pro Audio"`:**
+   - O mixer compartilhado do Windows processa áudio em períodos de **10,0 ms** (480 samples a 48 kHz). Usar `AUDCLNT_STREAMFLAGS_EVENTCALLBACK` acorda a thread de captura imediatamente via evento do kernel quando o bloco fecha, e `AvSetMmThreadCharacteristicsW("Pro Audio")` protege a captura e o envio TCP contra atrasos do agendador (documentação oficial Microsoft WASAPI / MMCSS).
+2. **Thread de Áudio dedicada (`AudioWorklet`) vs Thread Principal (`ScriptProcessorNode`):**
+   - Navegadores só expõem `AudioWorklet` (quantum fixo de 128 samples = **2,67 ms** em thread C++ dedicada, sem pausas de Garbage Collector da UI) em **contextos seguros** (`https://` ou `http://127.0.0.1`).
+   - Pelo **Túnel ADB** (`http://127.0.0.1:8765/?mode=usb`), o Chrome Android já entra direto em **Worklet 2,7 ms**.
+   - Se usar **Ancoragem USB** sem ADB (`http://192.168.x.x`), o app usa automaticamente o mesmo Ring Buffer em `ScriptProcessorNode(256)` (`5,3 ms`). *(Usuários avançados no Chrome Android também podem habilitar `chrome://flags/#unsafely-treat-insecure-origin-as-secure` com a URL USB para liberar o `AudioWorklet` fora de `127.0.0.1`.)*
+3. **ASRC (Controlador PI + Interpolação Cúbica de Hermite) e PLC por Espelhamento:**
+   - Inspirado em arquiteturas abertas como **`JoJoBond/3LAS`**, **WebRTC `NetEq`** e **`AudioRelay`**: em vez de agendar vários `AudioBufferSourceNode` separados (que acumulam jitter e travam em GC), o fluxo passa por um **Ring Buffer circular pré-alocado** (`16384` frames) reamostrado continuamente via **interpolação cúbica de Hermite (4 pontos Catmull-Rom)** guiada por um **controlador PI** suave (`±1,4%`), absorvendo diferenças de clock (48 kHz PC ↔ 44,1/48 kHz celular).
+   - Se algum pacote atrasar 1–6 ms na rede/USB, o **PLC (*Packet Loss Concealment*)** espelha suavemente a forma de onda recente com decaimento e faz *crossfade* de 0,67 ms na volta — evitando o "tec/picote" seco de zerar o som.
+4. **Atenção à latência do próprio Bluetooth (Celular → Fone):**
+   - A ponte **PC → Celular** consegue rodar em **10–15 ms** pelo Cabo USB, mas o enlace **Bluetooth** entre o celular e o fone adiciona sua própria latência (tipicamente **100–200 ms** em SBC/AAC comum, ou **40–80 ms** em modos *Low Latency* / *Gaming Mode* do fone). Para menor atraso total em vídeos e jogos, ative o **Modo Jogo / Baixa Latência** do seu fone Bluetooth (quando disponível).
 
 ---
 
