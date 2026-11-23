@@ -2,6 +2,14 @@
 *.dll
 *.pdb
 *.log
+*.apk
+*.so
+*.dex
+*.class
+*.ap_
+*.keystore
+*.idsig
+phone-audio-bridge/android/build/
 probe_test.txt
 .DS_Store
 Thumbs.db

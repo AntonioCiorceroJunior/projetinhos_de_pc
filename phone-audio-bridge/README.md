@@ -1,120 +1,99 @@
-# Phone Audio Bridge (`PhoneAudioBridge`)
+# Phone Audio Bridge v2.0 — USB Nativo (C# + C++ AAudio)
 
-Utilitário nativo e leve para Windows que transforma o **navegador do seu celular** (Android ou iPhone) em um receptor de áudio sem precisar instalar nenhum aplicativo no telefone — permitindo usar **qualquer fone Bluetooth pareado no celular** para ouvir o áudio do PC em tempo real via **QR Code**, com **modo Wi-Fi** e **modo Cabo USB de menor atraso**.
+Utilitário nativo e portátil para Windows que transforma o **celular Android conectado no cabo USB** em um receptor de áudio de baixíssima latência para o PC — **sem navegador, sem QR Code, sem Wi-Fi e sem precisar liberar firewall** — permitindo usar qualquer fone Bluetooth (ou fone P2/USB-C) conectado ao celular para ouvir o áudio do computador com atraso mínimo.
 
 ---
 
-## Por que este projeto existe?
-
-Muitos PCs de mesa não têm placa Bluetooth embutida (ou têm receptores USB 2.4 GHz proprietários de mouse/teclado/headset que não servem como Bluetooth). Em vez de ficar sem áudio ou instalar suítes pesadas, o **Phone Audio Bridge** cria uma ponte direta:
+## Como funciona na prática
 
 ```text
-[Áudio do Windows (WASAPI Loopback)] ──▶ [PhoneAudioBridge.exe] ──(Wi-Fi ou Cabo USB)──▶ [Navegador do Celular] ──▶ [Fone Bluetooth]
+[Áudio do Windows (WASAPI Loopback 10 ms + Âncora Silenciosa 48 kHz)]
+    ──▶ [PhoneAudioBridge.exe (C# .NET 4.x + MMCSS "Pro Audio", NoDelay)]
+    ──▶ [adb forward tcp:8765 localabstract:phoneaudiobridge]  (Unix socket = zero TCP/Nagle no Android)
+    ──▶ [PhoneAudioReceiver (Mini-APK C++17 AAudio LOW_LATENCY em ForegroundService)]
+    ──▶ [Fone Bluetooth / P2 / USB-C]
 ```
 
----
-
-## Principais Recursos
-
-* **QR Code gerado na hora (100% offline/nativo):** Escaneie com a câmera do celular para abrir o player direto no navegador (Chrome/Safari), sem instalar app no celular.
-* **Dois modos otimizados de transmissão:**
-  * **Modo Wi-Fi / Rede Local (~60 ms de buffer):** Prático e sem fios, usando pacotes de 20 ms via WebSocket.
-  * **Modo Cabo USB (~15 ms de buffer / 10 ms por bloco):** Alinhado 1:1 ao período nativo de 10 ms do WASAPI (480 frames a 48 kHz) com suporte automático a:
-    1. **Ancoragem USB (*USB Tethering*):** Detecta automaticamente a placa de rede USB RNDIS/Apple/Android e troca o QR Code para o IP do cabo assim que a ancoragem é ativada.
-    2. **Túnel ADB (recomendado para 10–15 ms liso no Android):** Se `adb.exe` estiver disponível no PC e a Depuração USB estiver ativa, cria `adb reverse tcp:8765 tcp:8765` automaticamente (`http://127.0.0.1:8765/?mode=usb`), liberando `AudioWorklet` em contexto seguro e dispensando firewall.
-* **Motor Ring-Buffer Contínuo (ASRC PI + Hermite + PLC) & Desconexão Limpa:** Substitui agendamentos fragmentados por um ring buffer pré-alocado (`16384` frames) com compensação contínua de *clock drift* via controlador PI, interpolação cúbica de Hermite, ocultação suave de micro-perdas (*PLC* por espelhamento) e **desconexão definitiva** se o Bluetooth/áudio do celular for desligado — sem reconectar sozinho depois.
-* **Seleção de dispositivo de saída & medidor de nível ao vivo:** Captura o dispositivo padrão do Windows ou uma saída específica, com barra VU em tempo real e alerta visual de conexão.
-* **Bandeja do Sistema (`^`):** Permite ocultar na área de notificação, alternar entre modos Wi-Fi/USB e marcar **"Iniciar com o Windows"**.
+1. **Pluge e conecte em 1 clique:** deixe o `PhoneAudioBridge.exe` aberto (ou minimizado na bandeja `^`). Assim que você pluga o cabo USB com **Depuração USB** ativa, o aplicativo detecta o aparelho pelo ADB e abre um pop-up perguntando: *"Deseja conectar o áudio do PC neste aparelho pelo cabo USB agora?"*.
+2. **Instalação automática do receptor (embutido no `.exe`):** o mini-APK Android (`PhoneAudioReceiver.apk`, `arm64-v8a`) já vai **embutido dentro do próprio `PhoneAudioBridge.exe`**. Na primeira conexão, o app instala o receptor automaticamente via `adb install -r -g`, abre o túnel Unix `localabstract:phoneaudiobridge` e inicia a reprodução em primeiro/segundo plano (`ForegroundService` tipo `mediaPlayback`).
+3. **Continua tocando com a tela desligada:** ao contrário do navegador Chrome no Android, o `AudioBridgeService` usa `FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK` + `PARTIAL_WAKE_LOCK` + stream nativo C++ AAudio. Pode apagar a tela do celular sem engasgos.
 
 ---
 
-## Como funciona tecnicamente
+## Latência Adaptativa Inteligente (`1–120 ms`, padrão `10 ms`)
 
-| Camada | Implementação / Tecnologia |
-| :--- | :--- |
-| **Captura de Áudio (Windows)** | **WASAPI Loopback Event-Driven** (`AUDCLNT_STREAMFLAGS_LOOPBACK \| EVENTCALLBACK`) + **MMCSS `"Pro Audio"`** (`avrt.dll`) + `timeBeginPeriod(1)`, com caminho rápido direto para blocos de **10 ms** (480 frames) e fallback automático para polling. |
-| **Servidor HTTP + WebSocket** | Servidor **TCP / HTTP / WebSocket (RFC 6455)** puro sobre `TcpListener` com `NoDelay = true`, thread `WS-Writer` elevada via MMCSS `"Pro Audio"`, frame binário único pré-montado (zero cópia por cliente) e fila anti-drop de 24 pacotes. |
-| **Gerador de QR Code** | Codificador **ISO/IEC 18004 (Versões 1–5, Nível M)** escrito do zero em C# com aritmética GF(256), Reed-Solomon, seleção de máscara de menor penalidade e renderização GDI+ nítida. |
-| **Player no Navegador** | **Pipeline `Web Worker → MessageChannel → AudioWorklet` (2,7 ms)** em contexto seguro (`127.0.0.1` via ADB) ou `ScriptProcessorNode(256)` (`5,3 ms`) em HTTP local; Ring Buffer com **ASRC (controlador PI + interpolação cúbica de Hermite)**, **crossfade Hann** sem degrau, **PLC por espelhamento**, telemetria ao vivo (`stats`) enviada ao PC, slider `10–180 ms`, presets (`10 / 15 / 60 ms`), `MediaSession` e `WakeLock`. |
+O motor de controle adaptativo (`AdaptiveLatencyController`) busca o menor atraso físico suportado pelo seu conjunto PC + USB + celular sem incomodar:
+
+* **Padrão inicial em `10 ms`:** já abre sincronizado 1:1 com o período nativo de `10 ms` do mixer WASAPI do Windows (`480 frames @ 48 kHz`).
+* **Redução silenciosa automática (`10 → 9 → ... → 1 ms`):**
+  * Se passar **`6,0 s` consecutivos com `0` cortes**, o app reduz silenciosamente **`-1 ms`** sem exibir nenhum pop-up e testa por `3,5 s`.
+  * Enquanto permanecer em `0` cortes, continua descendo `1 ms` por etapa até **`1 ms`**.
+  * Se detectar qualquer corte na etapa reduzida, volta silenciosamente **`+1 ms`** e trava naquele piso mínimo estável (sem oscilar).
+* **Estabilização assistida sob demanda:**
+  * Se ocorrerem cortes sustentados (**`≥ 4` eventos em `3,0 s`**), aparece um aviso na tela perguntando se você deseja estabilizar automaticamente.
+  * Clicando em **Sim**, o app sobe o buffer em degraus (`+2 ms` abaixo de `20 ms`, `+5 ms` acima de `20 ms`, máximo `120 ms`) a cada `2,5 s` até completar `4,0 s` seguidos com `0` cortes.
+  * Se você mexer no slider manual (`1–120 ms`), o piso anterior é zerado e o ajuste automático aguarda `10 s` antes de voltar a otimizar.
 
 ---
 
-## Engenharia de Baixa Latência (10–15 ms) e Referências
+## Engenharia de Baixa Latência & Resultados Medidos em Hardware Real
 
-Para manter o áudio liso em **10–15 ms** sem picotes mesmo no navegador do celular, o projeto combina técnicas usadas em áudio profissional e streaming em tempo real:
+### 1. Eliminação da trava TCP/Nagle (`adb reverse` 47 ms → `localabstract` 2 ms)
+* Na v1 (navegador via `adb reverse` TCP), o `adbd` do Android acumulava frames de áudio por **`40–80 ms`** esperando *Delayed ACK* do kernel Linux.
+* Na v2 nativa, usamos **`adb forward tcp:8765 localabstract:phoneaudiobridge`**: o cliente Android conecta em um socket Unix *abstract* direto (sem pilha TCP dentro do Android), com protocolo binário enxuto (`CONFIG`, `PCM`, `SET_TARGET_MS`, `SET_GAIN`, `PING/PONG`, `STATS`, `STOP`).
 
-1. **Alinhamento 1:1 com o motor WASAPI do Windows (`10 ms`) + Event-Driven + MMCSS `"Pro Audio"`:**
-   - O mixer compartilhado do Windows processa áudio em períodos de **10,0 ms** (480 samples a 48 kHz — confirmado em hardware via `IAudioClient3::GetSharedModeEnginePeriod`, onde `minPeriod = 480` frames é o piso nativo do driver). Usar `AUDCLNT_STREAMFLAGS_EVENTCALLBACK` acorda a thread de captura imediatamente via evento do kernel quando o bloco fecha, e `AvSetMmThreadCharacteristicsW("Pro Audio")` protege a captura e o envio TCP contra atrasos do agendador.
-   - Com blocos de `10 ms` saindo do PC, **`15 ms` costuma ser o ponto ideal com 0 cortes** (mantendo a serra do buffer entre `10` e `20 ms`), enquanto `10 ms` opera exatamente no limite físico do bloco WASAPI (`5–15 ms`).
-2. **Pipeline isolado `Web Worker → MessageChannel → AudioWorklet`:**
-   - Navegadores só expõem `AudioWorklet` (quantum fixo de 128 samples = **2,67 ms** em thread C++ dedicada, sem pausas de Garbage Collector da UI) em **contextos seguros** (`https://` ou `http://127.0.0.1`).
-   - Pelo **Túnel ADB** (`http://127.0.0.1:8765/?mode=usb`), o Chrome Android roda o `WebSocket` dentro de um **Web Worker dedicado** e envia os pacotes binários direto ao **`AudioWorklet`** via **`MessageChannel`** (*zero-copy*, tirando 100% da thread da UI do caminho do áudio).
-   - Se usar **Ancoragem USB** sem ADB (`http://192.168.x.x`), o app usa automaticamente o mesmo Ring Buffer em `ScriptProcessorNode(256)` (`5,3 ms`). *(Usuários avançados no Chrome Android também podem habilitar `chrome://flags/#unsafely-treat-insecure-origin-as-secure` com a URL USB para liberar o `AudioWorklet+Worker` fora de `127.0.0.1`.)*
-3. **ASRC (Controlador PI + Hermite), Crossfade Hann e PLC por Espelhamento:**
-   - Inspirado em arquiteturas abertas como **`JoJoBond/3LAS`**, **WebRTC `NetEq`** e **`AudioRelay`**: o fluxo passa por um **Ring Buffer circular pré-alocado** (`16384` frames) reamostrado via **interpolação cúbica de Hermite (4 pontos Catmull-Rom)** guiada por um **controlador PI** suave (`±1,4%`), absorvendo diferenças de clock (48 kHz PC ↔ 44,1/48 kHz celular).
-   - Se algum pacote atrasar 1–6 ms, o **PLC (*Packet Loss Concealment*)** espelha suavemente a forma de onda recente com decaimento e retorna ao áudio real com **crossfade Hann (cosseno elevado)** — sem salto de degrau ("pipoco").
-4. **Telemetria ao vivo no PC e em `/api/info`:**
-   - A cada ~400 ms, o navegador envia de volta ao PC o estado real do buffer (`bufMs`, `minBufMs`), o maior intervalo recebido no USB (`wsGapMaxMs`), cortes por segundo (`plcPerSec`) e resyncs — exibidos em tempo real no rodapé da janela do Windows e em `GET /api/info` (`clientStats`).
-5. **Reverse-ACK na interface loopback/ADB (`127.0.0.1`):**
-   - No túnel `adb reverse`, o daemon `adbd` do Android aceita conexões locais em `127.0.0.1` sem `TCP_NODELAY`. Como a MTU de loopback no Linux é `65536` bytes, pacotes de `1932` bytes (~10 ms) em stream só de descida ficam retidos pelo algoritmo de Nagle aguardando o *Delayed ACK* do kernel (`40–60 ms`), gerando rajadas de ~47 ms (`wsGapMaxMs`).
-   - Quando conectado em `127.0.0.1`/`localhost`, o `Web Worker` envia um ACK binário mínimo de `1` byte por bloco recebido (consumido sem alocação em `WsClientSession.ReaderLoop`), forçando a pilha TCP a emitir o ACK imediato, zerando a fila `Send-Q` no `adbd` e mantendo o fluxo liso em `~10 ms`.
-6. **Atenção à latência do próprio Bluetooth (Celular → Fone):**
-   - A ponte **PC → Celular** consegue rodar em **10–15 ms** pelo Cabo USB, mas o enlace **Bluetooth** entre o celular e o fone adiciona sua própria latência (tipicamente **100–200 ms** em SBC/AAC comum, ou **40–80 ms** em modos *Low Latency* / *Gaming Mode* do fone). Para menor atraso total em vídeos e jogos, ative o **Modo Jogo / Baixa Latência** do seu fone Bluetooth (quando disponível).
+### 2. Relógio mestre WASAPI por Âncora Silenciosa (`IAudioRenderClient`)
+* No Windows, o `WASAPI Loopback` compartilhado para de disparar eventos quando nenhum som está tocando. Um *keepalive* por timer gera colisões e rajadas duplicadas com o driver ao voltar do silêncio.
+* A solução definitiva usada em capturadores profissionais (OBS/MSDN) é abrir um **`IAudioClient` + `IAudioRenderClient` silencioso compartilhado** (`AUDCLNT_BUFFERFLAGS_SILENT = 2`) no mesmo dispositivo de saída: custo zero de CPU, áudio 100% mudo, mantendo o hardware WASAPI pulsando exatamente em **`48.000,0 Hz`** (`10,0 ms` contínuos).
+
+### 3. Telemetria real medida no **Motorola Edge 60 Pro (Android 17, `arm64-v8a`)**
+* **Caminho de áudio Android:** `AAudio` `PERFORMANCE_MODE_LOW_LATENCY` no `AudioOut_1D` (`FastMixer`), `48.000 Hz`, `burst = 256 frames` (`5,33 ms`), `buf = 512 frames` (`10,67 ms`), **`0` xruns de HAL**.
+* **Transporte USB ADB:** `pktGapMaxMs = 10–12 ms`, `rttMs = 2–4 ms`, **`0` resyncs**.
+* **Comportamento adaptativo ao vivo:** iniciou estável em **`10 ms`**, desceu sozinho para **`9 ms`** após `6 s` limpos, detectou `1` micro-underrun em `9 ms` e travou automaticamente no piso físico de **`10 ms`**.
+
+> **Nota física sobre o Bluetooth (Celular → Fone):** a ponte **PC → Celular** opera na casa de **`~10 ms`** com `0` resyncs, mas o próprio enlace Bluetooth A2DP entre celular e fone adiciona a latência inerente ao codec/buffer do fone (tipicamente `100–200 ms`, ou `40–80 ms` se o fone tiver *Modo Jogo*). No cabo P2/USB-C do celular o atraso ponta-a-ponta cai ao mínimo possível.
+
+---
+
+## Desconexão limpa ao desligar o Bluetooth (sem reconectar sozinho)
+
+* O `AudioBridgeService` monitora simultaneamente **`ACTION_AUDIO_BECOMING_NOISY`**, **`AudioDeviceCallback.onAudioDevicesRemoved`** (A2DP, BLE Audio, fones com fio/USB-C) e o **`errorCallback` (`AAUDIO_ERROR_DISCONNECTED`)** do AAudio.
+* Ao desligar o Bluetooth ou remover o fone — mesmo com a tela do celular apagada — o receptor nativo **encerra imediatamente** o AAudio, envia o sinal `0x86` ao PC para desligar o envio, fecha o túnel e encerra o serviço (`START_NOT_STICKY`).
+* O app nunca se registra para eventos de reconexão Bluetooth e mantém o aparelho silenciado no Watcher até que você desconecte/reconecte o cabo ou clique manualmente em **Conectar e Ouvir Agora**.
 
 ---
 
 ## Como compilar e usar
 
-### 1. Compilar o executável
-Não é necessário instalar SDK nem Visual Studio — o script compila com o `csc.exe` nativo do Windows:
+### Pré-requisitos
+* **Windows 10/11 (64 bits)** com `.NET Framework 4.x` nativo.
+* **`adb.exe`** (Google Platform-Tools — descoberto automaticamente via pasta do exe, `ANDROID_HOME`, `PATH` do Usuário/Máquina e pacotes WinGet).
+* **Para recompilar o APK Android (`-RebuildAndroid`):** JDK 17 + Android SDK Platform 35 + Build-Tools 35.0.0 + NDK (`arm64-v8a`, C++17 com `-static-libstdc++` e alinhamento `-Wl,-z,max-page-size=16384` para páginas de 16 KB do Android 15–17). *(Se o arquivo `PhoneAudioReceiver.apk` já estiver compilado na pasta, `.\build.ps1` usa-o direto sem precisar de NDK/SDK.)*
+
+### Compilar o executável portátil (e opcionalmente copiar para a Área de Trabalho)
 ```powershell
 cd phone-audio-bridge
-.\build.ps1
+.\build.ps1 -RebuildAndroid -CopyToDesktop
 ```
-Isso gera `PhoneAudioBridge.exe` na mesma pasta.
+*(Sem recompilar a parte Android: `.\build.ps1 -CopyToDesktop`)*
 
-Para já compilar e copiar o executável portátil direto para a sua **Área de Trabalho**:
-```powershell
-.\build.ps1 -CopyToDesktop
-```
-*(O `PhoneAudioBridge.exe` é arquivo único portátil — não precisa de DLLs nem de outros arquivos ao lado.)*
-
-### 2. Executar o aplicativo
+### Executar
 ```powershell
 Start-Process .\PhoneAudioBridge.exe
 ```
-
-### 3. Liberar Firewall (necessário para Wi-Fi ou Ancoragem USB)
-Se o celular não conseguir abrir o link pelo QR Code, clique no botão **"Liberar Firewall (Admin)"** dentro do próprio app, ou execute:
-```powershell
-powershell -ExecutionPolicy Bypass -File .\LiberarFirewall.ps1
-```
-
-### 4. Como usar o Modo Cabo USB (Menor Delay)
-1. No app do Windows, clique em **Cabo USB (Menor Delay)**.
-2. Plugue o cabo USB do celular no computador:
-   - **Android:** vá em **Configurações → Rede e internet / Ponto de acesso → Ancoragem USB** (*USB Tethering*) e ative. Assim que a placa USB subir no Windows, o app muda automaticamente o QR Code para o IP do cabo (`[Cabo USB] ...`). **Escaneie ou abra esse novo link USB** no navegador (se continuar na aba antiga do Wi-Fi, o áudio ainda estará passando pelo Wi-Fi!).
-   - **iPhone:** vá em **Ajustes → Acesso Pessoal**, ative e toque em **Confiar** no aviso de computador.
-   - *(Opcional Android com ADB)*: com **Depuração USB** ativa e `adb.exe` instalado, clique em **Tentar Túnel ADB** e acesse `http://127.0.0.1:8765/?mode=usb` no Chrome do celular.
-3. Conecte seu fone Bluetooth no celular, escaneie o QR Code atualizado e toque em **Conectar e Ouvir Áudio**.
-
-> **Dica sobre o som no PC:** Como a captura usa *WASAPI Loopback*, o app copia o áudio que está tocando na saída selecionada no Windows. Se você não quiser ouvir o som simultaneamente em outra caixa/headset do PC, selecione como saída no Windows um monitor sem alto-falantes ligados (ou reduza o volume físico da caixa) e deixe o volume do Windows normal — ou ajuste o dispositivo desejado no combo **Fonte de Áudio**.
-
----
-
-## O que acontece se eu desligar e ligar o Bluetooth do celular?
-
-* **Não reconecta sozinho ao PC:** como o computador não tem pareamento Bluetooth direto com o fone, religar o Bluetooth do celular **nunca** vai conectar o fone ao computador por conta própria — mesmo com o PC ligado.
-* **Desconexão automática ao desligar o Bluetooth:** quando você desliga o Bluetooth (ou desconecta o fone) enquanto a aba está aberta, o Android/iOS pausa o áudio da página e o player **encerra na hora a sessão com o PC** (fecha o canal WebSocket e desliga qualquer tentativa de reconexão em segundo plano).
-* **Ao religar o Bluetooth depois:** o fone conecta normalmente apenas ao seu celular. O áudio do PC só volta a tocar se você abrir o player e tocar manualmente em **Conectar e Ouvir Áudio**.
+Flags opcionais de linha de comando:
+* `--minimized`: inicia direto oculto na bandeja do sistema (`^`) — usado pela opção **"Iniciar com o Windows"**.
+* `--auto-connect`: conecta automaticamente no primeiro celular USB detectado ao abrir.
+* `--self-test [caminho_relatorio.txt]`: executa a bateria de autoteste.
 
 ---
 
 ## Autoteste técnico (`--self-test`)
 
-O executável inclui uma suíte de verificação automática que valida WASAPI Loopback, detecção de rede, síndromes Reed-Solomon do QR Code e handshake HTTP/WebSocket local:
+Valida **WASAPI Loopback Event-Driven**, integridade do **`PhoneAudioReceiver.apk` embutido** (`classes.dex` + `lib/arm64-v8a/libphoneaudioreceiver.so`), descoberta do **`adb.exe`**, **protocolo binário loopback** (`CONFIG`, `PCM`, `SET_TARGET_MS`, `PING/PONG`, `STATS`, `STOP`) e máquina de estados do **`AdaptiveLatencyController`**:
+
 ```powershell
-.\PhoneAudioBridge.exe --self-test .\selftest_out.txt .\selftest_qr.png
+.\PhoneAudioBridge.exe --self-test .\selftest_out.txt
 Get-Content .\selftest_out.txt
 ```
 
@@ -122,6 +101,9 @@ Get-Content .\selftest_out.txt
 
 ## Arquivos desta pasta
 
-* [`Program.cs`](./Program.cs) — Código-fonte completo (WASAPI Loopback COM, Servidor HTTP/WS RFC 6455, Gerador QR Code, Player HTML5 embutido e UI WinForms + Bandeja).
-* [`build.ps1`](./build.ps1) — Script de compilação via `.NET Framework 4.x` (`csc.exe`).
-* [`LiberarFirewall.ps1`](./LiberarFirewall.ps1) — Cria a regra de entrada TCP `8765` no Firewall do Windows (elevação UAC).
+* [`Program.cs`](./Program.cs) — App Windows completo em C# 5.0 (WASAPI Loopback + âncora render silenciosa, ADB auto-deploy, cliente binário `localabstract`, `AdaptiveLatencyController`, UI WinForms, pop-ups e bandeja).
+* [`build.ps1`](./build.ps1) — Compila `PhoneAudioBridge.exe` com o `PhoneAudioReceiver.apk` embutido como recurso gerenciado (`/resource`).
+* [`android/AndroidManifest.xml`](./android/AndroidManifest.xml) — Manifesto (`minSdk 29`, `targetSdk 35`, `FOREGROUND_SERVICE_MEDIA_PLAYBACK`).
+* [`android/jni/native_audio_engine.cpp`](./android/jni/native_audio_engine.cpp) — Motor C++17 (socket Unix `localabstract`, ring-buffer lock-free SPSC, Hermite cúbica, PI ASRC, crossfade Hann, PLC, AAudio `LOW_LATENCY` e JNI).
+* [`android/java/com/antoniociorcero/phoneaudiobridge/`](./android/java/com/antoniociorcero/phoneaudiobridge/) — `NativeBridge.java`, `AudioBridgeService.java` (`ForegroundService` + desconexão Bluetooth limpa) e `BridgeActivity.java`.
+* [`android/build_android.ps1`](./android/build_android.ps1) — Compila `libphoneaudioreceiver.so`, empacota DEX/APK com `aapt2`/`javac`/`d8`, alinha com `zipalign` e assina via `apksigner` sem Gradle.

@@ -5,12 +5,12 @@ using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.Drawing.Text;
+using System.Globalization;
 using System.IO;
 using System.Net;
-using System.Net.NetworkInformation;
 using System.Net.Sockets;
+using System.Reflection;
 using System.Runtime.InteropServices;
-using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
 using System.Windows.Forms;
@@ -18,10 +18,17 @@ using Microsoft.Win32;
 
 namespace PhoneAudioBridge
 {
-    internal enum BridgeMode
+    #region Data Models & Native Protocol Constants
+
+    internal enum AdaptiveState
     {
-        Wifi = 0,
-        Usb = 1
+        Warmup = 0,
+        Monitoring = 1,
+        ProbingDown = 2,
+        PromptPending = 3,
+        Stabilizing = 4,
+        FloorLocked = 5,
+        Manual = 6
     }
 
     internal sealed class AudioDeviceInfo
@@ -36,32 +43,20 @@ namespace PhoneAudioBridge
         }
     }
 
-    internal sealed class NetEndpointOption
+    internal sealed class AdbDeviceInfo
     {
-        public string InterfaceName;
-        public string Description;
-        public string IpAddress;
-        public bool IsUsb;
-        public bool IsAdb;
-        public bool IsVirtual;
+        public string Serial;
+        public string ModelFriendly;
 
         public string DisplayLabel
         {
             get
             {
-                if (IsAdb)
+                if (string.IsNullOrEmpty(ModelFriendly))
                 {
-                    return string.Format("[ADB Cabo USB] {0} ({1})", IpAddress, InterfaceName);
+                    return string.Format("Android USB ({0})", Serial);
                 }
-                if (IsUsb)
-                {
-                    return string.Format("[Cabo USB] {0} ({1})", IpAddress, InterfaceName);
-                }
-                if (IsVirtual)
-                {
-                    return string.Format("[Virtual] {0} ({1})", IpAddress, InterfaceName);
-                }
-                return string.Format("[Wi-Fi/LAN] {0} ({1})", IpAddress, InterfaceName);
+                return string.Format("{0} ({1})", ModelFriendly, Serial);
             }
         }
 
@@ -70,6 +65,89 @@ namespace PhoneAudioBridge
             return DisplayLabel;
         }
     }
+
+    internal sealed class ReceiverStats
+    {
+        public uint SeqLast;
+        public double BufMs;
+        public double MinBufMs;
+        public int PktGapMaxMs;
+        public int AAudioBurstFrames;
+        public int AAudioBufFrames;
+        public int AAudioFlags;
+        public uint PlcTotal;
+        public uint XRunTotal;
+        public uint ResyncTotal;
+        public uint AAudioSampleRate;
+        public int RttMs;
+
+        public bool IsLowLatency { get { return (AAudioFlags & 1) != 0; } }
+        public bool IsExclusive { get { return (AAudioFlags & 2) != 0; } }
+        public bool IsMmap { get { return (AAudioFlags & 4) != 0; } }
+        public uint TotalGlitches { get { return PlcTotal + XRunTotal + ResyncTotal; } }
+    }
+
+    internal static class BridgeProtocol
+    {
+        public const byte MsgConfig = 0x01;
+        public const byte MsgPcm = 0x02;
+        public const byte MsgSetTargetMs = 0x03;
+        public const byte MsgSetGain = 0x04;
+        public const byte MsgPing = 0x05;
+        public const byte MsgStop = 0x06;
+
+        public const byte MsgStats = 0x81;
+        public const byte MsgPong = 0x85;
+        public const byte MsgDisconnectedByPhone = 0x86;
+
+        public static void WriteU16(byte[] dst, int offset, ushort val)
+        {
+            dst[offset] = (byte)(val & 0xFF);
+            dst[offset + 1] = (byte)((val >> 8) & 0xFF);
+        }
+
+        public static void WriteU32(byte[] dst, int offset, uint val)
+        {
+            dst[offset] = (byte)(val & 0xFF);
+            dst[offset + 1] = (byte)((val >> 8) & 0xFF);
+            dst[offset + 2] = (byte)((val >> 16) & 0xFF);
+            dst[offset + 3] = (byte)((val >> 24) & 0xFF);
+        }
+
+        public static void WriteI64(byte[] dst, int offset, long val)
+        {
+            ulong u = (ulong)val;
+            for (int i = 0; i < 8; i++)
+            {
+                dst[offset + i] = (byte)((u >> (i * 8)) & 0xFF);
+            }
+        }
+
+        public static ushort ReadU16(byte[] src, int offset)
+        {
+            return (ushort)(src[offset] | (src[offset + 1] << 8));
+        }
+
+        public static uint ReadU32(byte[] src, int offset)
+        {
+            return (uint)(src[offset] |
+                          (src[offset + 1] << 8) |
+                          (src[offset + 2] << 16) |
+                          (src[offset + 3] << 24));
+        }
+
+        public static long ReadI64(byte[] src, int offset)
+        {
+            ulong u = 0;
+            for (int i = 0; i < 8; i++)
+            {
+                u |= ((ulong)src[offset + i]) << (i * 8);
+            }
+            return (long)u;
+        }
+    }
+
+    #endregion
 
     #region Native Win32 & WASAPI COM Interop
 
@@ -276,9 +354,21 @@ namespace PhoneAudioBridge
         int GetNextPacketSize(out uint pNumFramesInNextPacket);
     }
 
+    [ComImport]
+    [Guid("F294ACFC-3146-4483-A7BF-ADDCA7C260E2")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    internal interface IAudioRenderClient
+    {
+        [PreserveSig]
+        int GetBuffer(uint numFramesRequested, out IntPtr ppData);
+
+        [PreserveSig]
+        int ReleaseBuffer(uint numFramesWritten, uint dwFlags);
+    }
+
     #endregion
 
-    #region WASAPI Loopback Capture Engine
+    #region WASAPI Loopback Capture Engine (10 ms Event-Driven + Silent Render Clock Anchor)
 
     internal sealed class WasapiLoopbackCapture : IDisposable
     {
@@ -292,12 +382,12 @@ namespace PhoneAudioBridge
         private const int AudclntStreamFlagsEventCallback = 0x00040000;
         private const uint AudclntBufferFlagsSilent = 0x2;
         private const int AudclntDeviceInvalidated = unchecked((int)0x88890004);
-        private const ushort WaveFormatPcm = 1;
         private const ushort WaveFormatIeeeFloat = 3;
         private const ushort WaveFormatExtensible = 0xFFFE;
 
         private static readonly Guid IidAudioClient = new Guid("1CB9AD4C-DBFA-4C32-B178-C2F568A703B2");
         private static readonly Guid IidAudioCaptureClient = new Guid("C8ADBD64-E71E-48A0-A4DE-185C395CD317");
+        private static readonly Guid IidAudioRenderClient = new Guid("F294ACFC-3146-4483-A7BF-ADDCA7C260E2");
         private static readonly Guid SubFormatIeeeFloat = new Guid("00000003-0000-0010-8000-00aa00389b71");
         private static readonly Guid SubFormatPcm = new Guid("00000001-0000-0010-8000-00aa00389b71");
         private static readonly PROPERTYKEY PkeyDeviceFriendlyName = new PROPERTYKEY(new Guid("A45C254E-DF1C-4EFD-8020-67D146A850E0"), 14);
@@ -305,7 +395,7 @@ namespace PhoneAudioBridge
         private readonly object _sync = new object();
         private volatile bool _running;
         private volatile bool _restartRequested;
-        private volatile int _chunkMs = 20;
+        private const int ChunkMs = 10;
         private string _requestedDeviceId = "";
         private Thread _thread;
 
@@ -316,13 +406,6 @@ namespace PhoneAudioBridge
 
         public Action<byte[], int> OnPcmPacket;
         public Action<int, string> OnFormatChanged;
-
-        public void SetModeChunkMs(int chunkMs)
-        {
-            if (chunkMs < 5) chunkMs = 5;
-            if (chunkMs > 50) chunkMs = 50;
-            _chunkMs = chunkMs;
-        }
 
         public void SelectDevice(string deviceId)
         {
@@ -433,15 +516,9 @@ namespace PhoneAudioBridge
             try
             {
                 enumerator = (IMMDeviceEnumerator)new MMDeviceEnumeratorComObject();
-                int hr;
-                if (string.IsNullOrEmpty(deviceId))
-                {
-                    hr = enumerator.GetDefaultAudioEndpoint(ERender, ERoleConsole, out device);
-                }
-                else
-                {
-                    hr = enumerator.GetDevice(deviceId, out device);
-                }
+                int hr = string.IsNullOrEmpty(deviceId)
+                    ? enumerator.GetDefaultAudioEndpoint(ERender, ERoleConsole, out device)
+                    : enumerator.GetDevice(deviceId, out device);
 
                 if (hr != 0 || device == null)
                 {
@@ -656,8 +733,11 @@ namespace PhoneAudioBridge
             IMMDevice device = null;
             IAudioClient audioClient = null;
             IAudioCaptureClient captureClient = null;
+            IAudioClient silentRenderAc = null;
+            IAudioRenderClient silentRenderClient = null;
             IntPtr mixFormatPtr = IntPtr.Zero;
-
+            IntPtr silentRenderFmt = IntPtr.Zero;
+            uint silentRenderBufFrames = 0;
             AutoResetEvent audioEvent = null;
 
             try
@@ -695,6 +775,50 @@ namespace PhoneAudioBridge
                     friendly = "Saída padrão do Windows";
                 }
                 ActiveDeviceName = friendly;
+
+                // Silent shared-mode render anchor keeps Windows audio engine clocking loopback at exact 48 kHz even during silence
+                try
+                {
+                    object renAcObj;
+                    Guid iidAc = IidAudioClient;
+                    if (device.Activate(ref iidAc, ClsCtxAll, IntPtr.Zero, out renAcObj) == 0 && renAcObj != null)
+                    {
+                        silentRenderAc = (IAudioClient)renAcObj;
+                        if (silentRenderAc.GetMixFormat(out silentRenderFmt) == 0 &&
+                            silentRenderFmt != IntPtr.Zero &&
+                            silentRenderAc.Initialize(AudclntShareModeShared, 0, 1000000, 0, silentRenderFmt, IntPtr.Zero) == 0 &&
+                            silentRenderAc.GetBufferSize(out silentRenderBufFrames) == 0 &&
+                            silentRenderBufFrames > 0)
+                        {
+                            object rcObj;
+                            Guid iidRc = IidAudioRenderClient;
+                            if (silentRenderAc.GetService(ref iidRc, out rcObj) == 0 && rcObj != null)
+                            {
+                                silentRenderClient = (IAudioRenderClient)rcObj;
+                                IntPtr rPtr;
+                                if (silentRenderClient.GetBuffer(silentRenderBufFrames, out rPtr) == 0)
+                                {
+                                    silentRenderClient.ReleaseBuffer(silentRenderBufFrames, AudclntBufferFlagsSilent);
+                                }
+                                if (silentRenderAc.Start() != 0)
+                                {
+                                    Marshal.ReleaseComObject(silentRenderClient);
+                                    silentRenderClient = null;
+                                }
+                            }
+                        }
+                    }
+                    if (silentRenderClient == null && silentRenderAc != null)
+                    {
+                        Marshal.ReleaseComObject(silentRenderAc);
+                        silentRenderAc = null;
+                    }
+                }
+                catch
+                {
+                    if (silentRenderClient != null) { try { Marshal.ReleaseComObject(silentRenderClient); } catch { } silentRenderClient = null; }
+                    if (silentRenderAc != null) { try { Marshal.ReleaseComObject(silentRenderAc); } catch { } silentRenderAc = null; }
+                }
 
                 object clientObj;
                 Guid iidClient = IidAudioClient;
@@ -787,28 +911,34 @@ namespace PhoneAudioBridge
 
                 LastError = "";
 
-                int activeChunkMs = _chunkMs;
-                int targetChunkBytes = CalculateChunkBytes(outRate, activeChunkMs);
+                int targetChunkBytes = CalculateChunkBytes(outRate, ChunkMs);
+                byte[] silentChunk = new byte[targetChunkBytes];
                 byte[] accum = new byte[targetChunkBytes * 4];
                 int accumOffset = 0;
 
                 byte[] rawScratch = new byte[65536];
-                long lastPacketTick = Environment.TickCount;
-                long lastDefaultCheckTick = lastPacketTick;
+                Stopwatch pacingWatch = Stopwatch.StartNew();
+                long lastEmitMs = pacingWatch.ElapsedMilliseconds;
+                long lastAudioDataMs = lastEmitMs;
+                long lastDefaultCheckMs = lastEmitMs;
+
                 string activeDevId = "";
                 device.GetId(out activeDevId);
 
                 while (_running && !_restartRequested)
                 {
-                    if (_chunkMs != activeChunkMs)
+                    if (silentRenderAc != null && silentRenderClient != null && silentRenderBufFrames > 0)
                     {
-                        activeChunkMs = _chunkMs;
-                        targetChunkBytes = CalculateChunkBytes(outRate, activeChunkMs);
-                        if (accum.Length < targetChunkBytes * 4)
+                        uint pad;
+                        if (silentRenderAc.GetCurrentPadding(out pad) == 0 && pad < silentRenderBufFrames)
                         {
-                            accum = new byte[targetChunkBytes * 4];
+                            uint avail = silentRenderBufFrames - pad;
+                            IntPtr rPtr;
+                            if (silentRenderClient.GetBuffer(avail, out rPtr) == 0)
+                            {
+                                silentRenderClient.ReleaseBuffer(avail, AudclntBufferFlagsSilent);
+                            }
                         }
-                        accumOffset = 0;
                     }
 
                     uint nextFrames;
@@ -825,16 +955,26 @@ namespace PhoneAudioBridge
 
                     if (nextFrames == 0)
                     {
-                        long nowTick = Environment.TickCount;
-                        if (unchecked(nowTick - lastPacketTick) > 1200)
+                        long nowMs = pacingWatch.ElapsedMilliseconds;
+                        if ((nowMs - lastAudioDataMs) > 250)
                         {
                             CurrentLevel = 0f;
-                            accumOffset = 0;
                         }
 
-                        if (string.IsNullOrEmpty(targetId) && unchecked(nowTick - lastDefaultCheckTick) > 1500)
+                        // Fallback keepalive ONLY if silent render anchor could not be opened on this driver
+                        if (silentRenderAc == null && (nowMs - lastEmitMs) >= 45)
                         {
-                            lastDefaultCheckTick = nowTick;
+                            accumOffset = 0;
+                            lastEmitMs = nowMs;
+                            if (OnPcmPacket != null)
+                            {
+                                OnPcmPacket(silentChunk, outRate);
+                            }
+                        }
+
+                        if (string.IsNullOrEmpty(targetId) && (nowMs - lastDefaultCheckMs) > 1500)
+                        {
+                            lastDefaultCheckMs = nowMs;
                             IMMDevice curDef;
                             if (enumerator.GetDefaultAudioEndpoint(ERender, ERoleConsole, out curDef) == 0 && curDef != null)
                             {
@@ -867,11 +1007,7 @@ namespace PhoneAudioBridge
                         ulong devPos;
                         ulong qpcPos;
                         hr = captureClient.GetBuffer(out dataPtr, out numFrames, out flags, out devPos, out qpcPos);
-                        if (hr == AudclntDeviceInvalidated)
-                        {
-                            return;
-                        }
-                        if (hr != 0)
+                        if (hr == AudclntDeviceInvalidated || hr != 0)
                         {
                             return;
                         }
@@ -905,7 +1041,9 @@ namespace PhoneAudioBridge
                                         directChunk,
                                         0);
                                     CurrentLevel = CurrentLevel * 0.65f + Math.Min(1f, peakFast * 1.4f) * 0.35f;
-                                    lastPacketTick = Environment.TickCount;
+                                    long nowEmit = pacingWatch.ElapsedMilliseconds;
+                                    lastEmitMs = nowEmit;
+                                    lastAudioDataMs = nowEmit;
                                     if (OnPcmPacket != null)
                                     {
                                         OnPcmPacket(directChunk, outRate);
@@ -940,22 +1078,21 @@ namespace PhoneAudioBridge
                                             decimFactor,
                                             accum,
                                             accumOffset);
+                                        lastAudioDataMs = pacingWatch.ElapsedMilliseconds;
                                     }
                                     else
                                     {
                                         Array.Clear(accum, accumOffset, pcmBytes);
                                     }
 
-                                    float smoothed = CurrentLevel * 0.65f + Math.Min(1f, peak * 1.4f) * 0.35f;
-                                    CurrentLevel = smoothed;
-                                    lastPacketTick = Environment.TickCount;
-
+                                    CurrentLevel = CurrentLevel * 0.65f + Math.Min(1f, peak * 1.4f) * 0.35f;
                                     accumOffset += pcmBytes;
                                     int sendOffset = 0;
                                     while (accumOffset - sendOffset >= targetChunkBytes)
                                     {
                                         byte[] chunk = new byte[targetChunkBytes];
                                         Buffer.BlockCopy(accum, sendOffset, chunk, 0, targetChunkBytes);
+                                        lastEmitMs = pacingWatch.ElapsedMilliseconds;
                                         if (OnPcmPacket != null)
                                         {
                                             OnPcmPacket(chunk, outRate);
@@ -994,13 +1131,20 @@ namespace PhoneAudioBridge
                 {
                     try { audioClient.Stop(); } catch { }
                 }
+                if (silentRenderAc != null)
+                {
+                    try { silentRenderAc.Stop(); } catch { }
+                }
                 if (audioEvent != null)
                 {
                     try { audioEvent.Close(); } catch { }
                 }
                 if (mixFormatPtr != IntPtr.Zero) Marshal.FreeCoTaskMem(mixFormatPtr);
+                if (silentRenderFmt != IntPtr.Zero) Marshal.FreeCoTaskMem(silentRenderFmt);
                 if (captureClient != null) Marshal.ReleaseComObject(captureClient);
                 if (audioClient != null) Marshal.ReleaseComObject(audioClient);
+                if (silentRenderClient != null) Marshal.ReleaseComObject(silentRenderClient);
+                if (silentRenderAc != null) Marshal.ReleaseComObject(silentRenderAc);
                 if (device != null) Marshal.ReleaseComObject(device);
                 if (enumerator != null) Marshal.ReleaseComObject(enumerator);
             }
@@ -1025,14 +1169,8 @@ namespace PhoneAudioBridge
                 IntPtr subPtr = new IntPtr(fmtPtr.ToInt64() + 24);
                 Marshal.Copy(subPtr, guidBytes, 0, 16);
                 Guid subFormat = new Guid(guidBytes);
-                if (subFormat == SubFormatIeeeFloat)
-                {
-                    return true;
-                }
-                if (subFormat == SubFormatPcm)
-                {
-                    return false;
-                }
+                if (subFormat == SubFormatIeeeFloat) return true;
+                if (subFormat == SubFormatPcm) return false;
             }
             return wfx.wBitsPerSample == 32;
         }
@@ -1135,589 +1273,15 @@ namespace PhoneAudioBridge
 
     #endregion
 
-    #region QR Code Generator (ISO/IEC 18004, Versions 1-5, Level M)
+    #region ADB Discovery, Embedded APK Auto-Deploy & Tunnel Helper
 
-    internal sealed class QrMatrixResult
+    internal static class AdbHelper
     {
-        public int Version;
-        public int Size;
-        public bool[,] Modules;
-        public int Mask;
-        public List<byte[]> DataBlocks;
-        public List<byte[]> EcBlocks;
-    }
-
-    internal static class QrCodeGenerator
-    {
-        private static readonly int[] GfExp = new int[512];
-        private static readonly int[] GfLog = new int[256];
-
-        private struct VersionSpec
-        {
-            public int Version;
-            public int Size;
-            public int TotalDataBytes;
-            public int EcBytesPerBlock;
-            public int NumBlocks;
-            public int AlignPos;
-        }
-
-        private static readonly VersionSpec[] SpecsM = new VersionSpec[]
-        {
-            new VersionSpec { Version = 1, Size = 21, TotalDataBytes = 16, EcBytesPerBlock = 10, NumBlocks = 1, AlignPos = 0 },
-            new VersionSpec { Version = 2, Size = 25, TotalDataBytes = 28, EcBytesPerBlock = 16, NumBlocks = 1, AlignPos = 18 },
-            new VersionSpec { Version = 3, Size = 29, TotalDataBytes = 44, EcBytesPerBlock = 26, NumBlocks = 1, AlignPos = 22 },
-            new VersionSpec { Version = 4, Size = 33, TotalDataBytes = 64, EcBytesPerBlock = 18, NumBlocks = 2, AlignPos = 26 },
-            new VersionSpec { Version = 5, Size = 37, TotalDataBytes = 86, EcBytesPerBlock = 24, NumBlocks = 2, AlignPos = 30 }
-        };
-
-        static QrCodeGenerator()
-        {
-            int x = 1;
-            for (int i = 0; i < 255; i++)
-            {
-                GfExp[i] = x;
-                GfLog[x] = i;
-                x <<= 1;
-                if ((x & 0x100) != 0)
-                {
-                    x ^= 0x11D;
-                }
-            }
-            for (int i = 255; i < 512; i++)
-            {
-                GfExp[i] = GfExp[i - 255];
-            }
-        }
-
-        private static int GfMul(int a, int b)
-        {
-            if (a == 0 || b == 0) return 0;
-            return GfExp[GfLog[a] + GfLog[b]];
-        }
-
-        private static byte[] BuildGeneratorPoly(int degree)
-        {
-            byte[] poly = new byte[degree + 1];
-            poly[0] = 1;
-            for (int i = 0; i < degree; i++)
-            {
-                int root = GfExp[i];
-                for (int j = i + 1; j >= 1; j--)
-                {
-                    poly[j] = (byte)(poly[j] ^ GfMul(poly[j - 1], root));
-                }
-            }
-            return poly;
-        }
-
-        private static byte[] ComputeRsRemainder(byte[] data, int ecCount)
-        {
-            byte[] gen = BuildGeneratorPoly(ecCount);
-            byte[] rem = new byte[ecCount];
-            for (int i = 0; i < data.Length; i++)
-            {
-                byte factor = (byte)(data[i] ^ rem[0]);
-                Buffer.BlockCopy(rem, 1, rem, 0, ecCount - 1);
-                rem[ecCount - 1] = 0;
-                for (int j = 0; j < ecCount; j++)
-                {
-                    rem[j] ^= (byte)GfMul(gen[j + 1], factor);
-                }
-            }
-            return rem;
-        }
-
-        public static bool VerifyReedSolomonSyndromes(QrMatrixResult qr)
-        {
-            if (qr == null || qr.DataBlocks.Count != qr.EcBlocks.Count) return false;
-            for (int b = 0; b < qr.DataBlocks.Count; b++)
-            {
-                byte[] d = qr.DataBlocks[b];
-                byte[] e = qr.EcBlocks[b];
-                int n = d.Length + e.Length;
-                byte[] cw = new byte[n];
-                Buffer.BlockCopy(d, 0, cw, 0, d.Length);
-                Buffer.BlockCopy(e, 0, cw, d.Length, e.Length);
-
-                for (int i = 0; i < e.Length; i++)
-                {
-                    int alpha = GfExp[i];
-                    int eval = 0;
-                    for (int k = 0; k < n; k++)
-                    {
-                        eval = GfMul(eval, alpha) ^ cw[k];
-                    }
-                    if (eval != 0)
-                    {
-                        return false;
-                    }
-                }
-            }
-            return true;
-        }
-
-        public static QrMatrixResult Encode(string text)
-        {
-            byte[] payload = Encoding.UTF8.GetBytes(text);
-            VersionSpec spec = new VersionSpec();
-            bool found = false;
-            for (int i = 0; i < SpecsM.Length; i++)
-            {
-                int maxBytes = (SpecsM[i].TotalDataBytes * 8 - 12) / 8;
-                if (payload.Length <= maxBytes)
-                {
-                    spec = SpecsM[i];
-                    found = true;
-                    break;
-                }
-            }
-
-            if (!found)
-            {
-                throw new ArgumentException("Texto muito longo para QR Code V1-V5: " + payload.Length + " bytes.");
-            }
-
-            List<int> bits = new List<int>(spec.TotalDataBytes * 8);
-            AppendBits(bits, 4, 4); // Mode Byte = 0100
-            AppendBits(bits, payload.Length, 8);
-            for (int i = 0; i < payload.Length; i++)
-            {
-                AppendBits(bits, payload[i], 8);
-            }
-
-            int totalDataBits = spec.TotalDataBytes * 8;
-            int term = Math.Min(4, totalDataBits - bits.Count);
-            AppendBits(bits, 0, term);
-            while ((bits.Count % 8) != 0)
-            {
-                bits.Add(0);
-            }
-
-            byte[] dataBytes = new byte[spec.TotalDataBytes];
-            int byteCount = bits.Count / 8;
-            for (int i = 0; i < byteCount; i++)
-            {
-                int v = 0;
-                for (int b = 0; b < 8; b++)
-                {
-                    v = (v << 1) | bits[i * 8 + b];
-                }
-                dataBytes[i] = (byte)v;
-            }
-            for (int i = byteCount; i < spec.TotalDataBytes; i++)
-            {
-                dataBytes[i] = ((i - byteCount) % 2 == 0) ? (byte)0xEC : (byte)0x11;
-            }
-
-            int blockDataLen = spec.TotalDataBytes / spec.NumBlocks;
-            var dataBlocks = new List<byte[]>();
-            var ecBlocks = new List<byte[]>();
-            for (int b = 0; b < spec.NumBlocks; b++)
-            {
-                byte[] blk = new byte[blockDataLen];
-                Buffer.BlockCopy(dataBytes, b * blockDataLen, blk, 0, blockDataLen);
-                byte[] ec = ComputeRsRemainder(blk, spec.EcBytesPerBlock);
-                dataBlocks.Add(blk);
-                ecBlocks.Add(ec);
-            }
-
-            byte[] finalCodewords = new byte[spec.TotalDataBytes + spec.NumBlocks * spec.EcBytesPerBlock];
-            int idx = 0;
-            for (int i = 0; i < blockDataLen; i++)
-            {
-                for (int b = 0; b < spec.NumBlocks; b++)
-                {
-                    finalCodewords[idx++] = dataBlocks[b][i];
-                }
-            }
-            for (int i = 0; i < spec.EcBytesPerBlock; i++)
-            {
-                for (int b = 0; b < spec.NumBlocks; b++)
-                {
-                    finalCodewords[idx++] = ecBlocks[b][i];
-                }
-            }
-
-            int size = spec.Size;
-            bool[,] baseMods = new bool[size, size];
-            bool[,] isFunc = new bool[size, size];
-
-            DrawFinderWithSeparator(baseMods, isFunc, 0, 0, size);
-            DrawFinderWithSeparator(baseMods, isFunc, 0, size - 7, size);
-            DrawFinderWithSeparator(baseMods, isFunc, size - 7, 0, size);
-
-            if (spec.AlignPos > 0)
-            {
-                DrawAlignmentPattern(baseMods, isFunc, spec.AlignPos, spec.AlignPos);
-            }
-
-            for (int i = 8; i < size - 8; i++)
-            {
-                bool dark = (i % 2) == 0;
-                SetFuncModule(baseMods, isFunc, 6, i, dark);
-                SetFuncModule(baseMods, isFunc, i, 6, dark);
-            }
-
-            // Dark module always at (size - 8, 8)
-            SetFuncModule(baseMods, isFunc, size - 8, 8, true);
-
-            // Reserve format information cells
-            ReserveFormatModules(isFunc, size);
-
-            // Place data bits in zig-zag
-            int bitPos = 0;
-            int totalCodewordBits = finalCodewords.Length * 8;
-            int dir = -1;
-            int col = size - 1;
-            while (col > 0)
-            {
-                if (col == 6) col--;
-                int r = (dir == -1) ? (size - 1) : 0;
-                while (r >= 0 && r < size)
-                {
-                    for (int dc = 0; dc < 2; dc++)
-                    {
-                        int c = col - dc;
-                        if (!isFunc[r, c])
-                        {
-                            bool bitVal = false;
-                            if (bitPos < totalCodewordBits)
-                            {
-                                bitVal = ((finalCodewords[bitPos >> 3] >> (7 - (bitPos & 7))) & 1) != 0;
-                                bitPos++;
-                            }
-                            baseMods[r, c] = bitVal;
-                        }
-                    }
-                    r += dir;
-                }
-                dir = -dir;
-                col -= 2;
-            }
-
-            int bestMask = 0;
-            int bestPenalty = int.MaxValue;
-            bool[,] bestGrid = null;
-
-            for (int mask = 0; mask < 8; mask++)
-            {
-                bool[,] cand = new bool[size, size];
-                for (int r = 0; r < size; r++)
-                {
-                    for (int c = 0; c < size; c++)
-                    {
-                        if (isFunc[r, c])
-                        {
-                            cand[r, c] = baseMods[r, c];
-                        }
-                        else
-                        {
-                            cand[r, c] = baseMods[r, c] ^ IsMasked(mask, r, c);
-                        }
-                    }
-                }
-                WriteFormatInfo(cand, size, mask);
-                int pen = ComputePenalty(cand, size);
-                if (pen < bestPenalty)
-                {
-                    bestPenalty = pen;
-                    bestMask = mask;
-                    bestGrid = cand;
-                }
-            }
-
-            return new QrMatrixResult
-            {
-                Version = spec.Version,
-                Size = size,
-                Modules = bestGrid,
-                Mask = bestMask,
-                DataBlocks = dataBlocks,
-                EcBlocks = ecBlocks
-            };
-        }
-
-        public static Bitmap RenderBitmap(QrMatrixResult qr, int pixelsPerModule, int quietModules)
-        {
-            int totalMods = qr.Size + quietModules * 2;
-            int imgSize = totalMods * pixelsPerModule;
-            Bitmap bmp = new Bitmap(imgSize, imgSize, PixelFormat.Format24bppRgb);
-            using (Graphics g = Graphics.FromImage(bmp))
-            {
-                g.Clear(Color.White);
-                g.SmoothingMode = SmoothingMode.None;
-                g.InterpolationMode = InterpolationMode.NearestNeighbor;
-                using (SolidBrush black = new SolidBrush(Color.FromArgb(14, 18, 28)))
-                {
-                    for (int r = 0; r < qr.Size; r++)
-                    {
-                        for (int c = 0; c < qr.Size; c++)
-                        {
-                            if (qr.Modules[r, c])
-                            {
-                                g.FillRectangle(
-                                    black,
-                                    (c + quietModules) * pixelsPerModule,
-                                    (r + quietModules) * pixelsPerModule,
-                                    pixelsPerModule,
-                                    pixelsPerModule);
-                            }
-                        }
-                    }
-                }
-            }
-            return bmp;
-        }
-
-        private static void AppendBits(List<int> bits, int value, int bitCount)
-        {
-            for (int i = bitCount - 1; i >= 0; i--)
-            {
-                bits.Add((value >> i) & 1);
-            }
-        }
-
-        private static void SetFuncModule(bool[,] mods, bool[,] isFunc, int r, int c, bool dark)
-        {
-            mods[r, c] = dark;
-            isFunc[r, c] = true;
-        }
-
-        private static void DrawFinderWithSeparator(bool[,] mods, bool[,] isFunc, int top, int left, int size)
-        {
-            for (int dr = -1; dr <= 7; dr++)
-            {
-                for (int dc = -1; dc <= 7; dc++)
-                {
-                    int r = top + dr;
-                    int c = left + dc;
-                    if (r < 0 || r >= size || c < 0 || c >= size) continue;
-                    bool dark = false;
-                    if (dr >= 0 && dr <= 6 && dc >= 0 && dc <= 6)
-                    {
-                        int dist = Math.Max(Math.Abs(dr - 3), Math.Abs(dc - 3));
-                        dark = dist != 2;
-                    }
-                    SetFuncModule(mods, isFunc, r, c, dark);
-                }
-            }
-        }
-
-        private static void DrawAlignmentPattern(bool[,] mods, bool[,] isFunc, int centerR, int centerC)
-        {
-            for (int dr = -2; dr <= 2; dr++)
-            {
-                for (int dc = -2; dc <= 2; dc++)
-                {
-                    int dist = Math.Max(Math.Abs(dr), Math.Abs(dc));
-                    SetFuncModule(mods, isFunc, centerR + dr, centerC + dc, dist != 1);
-                }
-            }
-        }
-
-        private static void ReserveFormatModules(bool[,] isFunc, int size)
-        {
-            for (int i = 0; i <= 8; i++)
-            {
-                if (i != 6)
-                {
-                    isFunc[8, i] = true;
-                    isFunc[i, 8] = true;
-                }
-            }
-            for (int i = 0; i < 8; i++)
-            {
-                isFunc[8, size - 1 - i] = true;
-                if (i < 7)
-                {
-                    isFunc[size - 1 - i, 8] = true;
-                }
-            }
-        }
-
-        private static bool IsMasked(int mask, int r, int c)
-        {
-            switch (mask)
-            {
-                case 0: return ((r + c) % 2) == 0;
-                case 1: return (r % 2) == 0;
-                case 2: return (c % 3) == 0;
-                case 3: return ((r + c) % 3) == 0;
-                case 4: return (((r / 2) + (c / 3)) % 2) == 0;
-                case 5: return (((r * c) % 2) + ((r * c) % 3)) == 0;
-                case 6: return ((((r * c) % 2) + ((r * c) % 3)) % 2) == 0;
-                case 7: return ((((r + c) % 2) + ((r * c) % 3)) % 2) == 0;
-                default: return false;
-            }
-        }
-
-        private static void WriteFormatInfo(bool[,] grid, int size, int mask)
-        {
-            // Level M = 00
-            int data5 = mask & 0x7;
-            int rem = data5 << 10;
-            for (int i = 14; i >= 10; i--)
-            {
-                if (((rem >> i) & 1) != 0)
-                {
-                    rem ^= (0x537 << (i - 10));
-                }
-            }
-            int fmt = ((data5 << 10) | rem) ^ 0x5412;
-
-            // Copy 1 (top-left)
-            for (int i = 0; i <= 5; i++)
-            {
-                grid[8, i] = ((fmt >> (14 - i)) & 1) != 0;
-            }
-            grid[8, 7] = ((fmt >> 8) & 1) != 0;
-            grid[8, 8] = ((fmt >> 7) & 1) != 0;
-            grid[7, 8] = ((fmt >> 6) & 1) != 0;
-            for (int i = 0; i <= 5; i++)
-            {
-                grid[5 - i, 8] = ((fmt >> (5 - i)) & 1) != 0;
-            }
-
-            // Copy 2 (bottom-left + top-right)
-            for (int i = 0; i < 7; i++)
-            {
-                grid[size - 1 - i, 8] = ((fmt >> (14 - i)) & 1) != 0;
-            }
-            for (int i = 0; i < 8; i++)
-            {
-                grid[8, size - 8 + i] = ((fmt >> (7 - i)) & 1) != 0;
-            }
-        }
-
-        private static int ComputePenalty(bool[,] m, int size)
-        {
-            int pen = 0;
-
-            // Rule 1: 5+ consecutive same-color modules
-            for (int r = 0; r < size; r++)
-            {
-                int run = 1;
-                for (int c = 1; c < size; c++)
-                {
-                    if (m[r, c] == m[r, c - 1])
-                    {
-                        run++;
-                    }
-                    else
-                    {
-                        if (run >= 5) pen += 3 + (run - 5);
-                        run = 1;
-                    }
-                }
-                if (run >= 5) pen += 3 + (run - 5);
-            }
-            for (int c = 0; c < size; c++)
-            {
-                int run = 1;
-                for (int r = 1; r < size; r++)
-                {
-                    if (m[r, c] == m[r - 1, c])
-                    {
-                        run++;
-                    }
-                    else
-                    {
-                        if (run >= 5) pen += 3 + (run - 5);
-                        run = 1;
-                    }
-                }
-                if (run >= 5) pen += 3 + (run - 5);
-            }
-
-            // Rule 2: 2x2 blocks
-            for (int r = 0; r < size - 1; r++)
-            {
-                for (int c = 0; c < size - 1; c++)
-                {
-                    bool v = m[r, c];
-                    if (m[r, c + 1] == v && m[r + 1, c] == v && m[r + 1, c + 1] == v)
-                    {
-                        pen += 3;
-                    }
-                }
-            }
-
-            // Rule 3: finder-like patterns 1:1:3:1:1 with 4 light modules on either side
-            for (int r = 0; r < size; r++)
-            {
-                for (int c = 0; c <= size - 11; c++)
-                {
-                    if (MatchesFinderLikeRow(m, r, c) || MatchesFinderLikeRowRev(m, r, c)) pen += 40;
-                }
-            }
-            for (int c = 0; c < size; c++)
-            {
-                for (int r = 0; r <= size - 11; r++)
-                {
-                    if (MatchesFinderLikeCol(m, r, c) || MatchesFinderLikeColRev(m, r, c)) pen += 40;
-                }
-            }
-
-            // Rule 4: dark ratio deviation from 50%
-            int dark = 0;
-            int total = size * size;
-            for (int r = 0; r < size; r++)
-            {
-                for (int c = 0; c < size; c++)
-                {
-                    if (m[r, c]) dark++;
-                }
-            }
-            int pct5 = Math.Abs(dark * 100 - total * 50) * 2 / (total * 10);
-            pen += pct5 * 10;
-
-            return pen;
-        }
-
-        private static bool MatchesFinderLikeRow(bool[,] m, int r, int c)
-        {
-            return m[r, c] && !m[r, c + 1] && m[r, c + 2] && m[r, c + 3] && m[r, c + 4] && !m[r, c + 5] && m[r, c + 6]
-                && !m[r, c + 7] && !m[r, c + 8] && !m[r, c + 9] && !m[r, c + 10];
-        }
-
-        private static bool MatchesFinderLikeRowRev(bool[,] m, int r, int c)
-        {
-            return !m[r, c] && !m[r, c + 1] && !m[r, c + 2] && !m[r, c + 3]
-                && m[r, c + 4] && !m[r, c + 5] && m[r, c + 6] && m[r, c + 7] && m[r, c + 8] && !m[r, c + 9] && m[r, c + 10];
-        }
-
-        private static bool MatchesFinderLikeCol(bool[,] m, int r, int c)
-        {
-            return m[r, c] && !m[r + 1, c] && m[r + 2, c] && m[r + 3, c] && m[r + 4, c] && !m[r + 5, c] && m[r + 6, c]
-                && !m[r + 7, c] && !m[r + 8, c] && !m[r + 9, c] && !m[r + 10, c];
-        }
-
-        private static bool MatchesFinderLikeColRev(bool[,] m, int r, int c)
-        {
-            return !m[r, c] && !m[r + 1, c] && !m[r + 2, c] && !m[r + 3, c]
-                && m[r + 4, c] && !m[r + 5, c] && m[r + 6, c] && m[r + 7, c] && m[r + 8, c] && !m[r + 9, c] && m[r + 10, c];
-        }
-    }
-
-    #endregion
-
-    #region Network, USB Tethering & ADB Tunnel Helper
-
-    internal static class NetworkHelper
-    {
-        private static readonly string[] UsbKeywords = new string[]
-        {
-            "rndis", "usb", "android", "apple mobile", "iphone", "tethering",
-            "gadget", "samsung mobile", "ndis based internet sharing", "ncm", "ecm", "usbn"
-        };
-
-        private static readonly string[] VirtualKeywords = new string[]
-        {
-            "vethernet", "hyper-v", "wsl", "virtualbox", "vmware", "docker",
-            "tailscale", "zerotier", "radmin", "hamachi", "wireguard", "nordlynx",
-            "loopback", "tap-windows", "wintun", "teredo", "isatap"
-        };
+        public const string PackageName = "com.antoniociorcero.phoneaudiobridge";
+        public const string ActivityName = "com.antoniociorcero.phoneaudiobridge/.BridgeActivity";
+        public const string AbstractSocket = "localabstract:phoneaudiobridge";
+        public const string ExpectedVersionCodeMarker = "versionCode=2";
+        public const string ResourceName = "PhoneAudioReceiver.apk";
 
         public static string FindAdbExecutable()
         {
@@ -1734,7 +1298,8 @@ namespace PhoneAudioBridge
                 {
                     Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"Android\Sdk\platform-tools\adb.exe"),
                     @"C:\platform-tools\adb.exe",
-                    @"C:\Android\platform-tools\adb.exe"
+                    @"C:\Android\platform-tools\adb.exe",
+                    @"C:\Android\Sdk\platform-tools\adb.exe"
                 };
                 for (int i = 0; i < candidates.Length; i++)
                 {
@@ -1776,54 +1341,172 @@ namespace PhoneAudioBridge
             return "";
         }
 
-        public static bool TrySetupAdbReverse(int port, out string statusMessage)
+        public static Stream OpenEmbeddedApkStream()
         {
-            statusMessage = "adb.exe não encontrado";
-            string adb = FindAdbExecutable();
-            if (string.IsNullOrEmpty(adb))
+            Assembly asm = Assembly.GetExecutingAssembly();
+            Stream s = asm.GetManifestResourceStream(ResourceName);
+            if (s != null) return s;
+
+            string[] names = asm.GetManifestResourceNames();
+            for (int i = 0; i < names.Length; i++)
             {
-                return false;
+                if (names[i].EndsWith(ResourceName, StringComparison.OrdinalIgnoreCase))
+                {
+                    return asm.GetManifestResourceStream(names[i]);
+                }
+            }
+            return null;
+        }
+
+        public static List<AdbDeviceInfo> ListOnlineDevices(string adbExe)
+        {
+            var list = new List<AdbDeviceInfo>();
+            if (string.IsNullOrEmpty(adbExe) || !File.Exists(adbExe))
+            {
+                return list;
             }
 
             try
             {
-                string devsOut = RunShortCommand(adb, "devices", 1800);
-                bool hasOnlineDevice = false;
-                string[] lines = devsOut.Split(new char[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+                int exitCode;
+                string outText = RunCommand(adbExe, "devices -l", 2000, out exitCode);
+                string[] lines = outText.Split(new char[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
                 for (int i = 0; i < lines.Length; i++)
                 {
                     string line = lines[i].Trim();
-                    if (line.StartsWith("List of devices", StringComparison.OrdinalIgnoreCase)) continue;
-                    if (line.EndsWith("\tdevice", StringComparison.OrdinalIgnoreCase) || line.Contains(" device"))
+                    if (line.Length == 0 || line.StartsWith("List of devices", StringComparison.OrdinalIgnoreCase))
                     {
-                        if (!line.Contains("offline") && !line.Contains("unauthorized"))
+                        continue;
+                    }
+
+                    string[] toks = line.Split(new char[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+                    if (toks.Length < 2) continue;
+                    string serial = toks[0];
+                    string state = toks[1];
+                    if (!string.Equals(state, "device", StringComparison.OrdinalIgnoreCase)) continue;
+
+                    string model = "";
+                    for (int j = 2; j < toks.Length; j++)
+                    {
+                        if (toks[j].StartsWith("model:", StringComparison.OrdinalIgnoreCase))
                         {
-                            hasOnlineDevice = true;
+                            model = toks[j].Substring(6).Replace('_', ' ').Trim();
                             break;
+                        }
+                    }
+
+                    list.Add(new AdbDeviceInfo
+                    {
+                        Serial = serial,
+                        ModelFriendly = model
+                    });
+                }
+            }
+            catch
+            {
+            }
+
+            return list;
+        }
+
+        public static bool EnsureReceiverInstalled(string adbExe, string serial, out string status)
+        {
+            status = "";
+            if (string.IsNullOrEmpty(adbExe) || string.IsNullOrEmpty(serial))
+            {
+                status = "ADB ou serial ausente.";
+                return false;
+            }
+
+            int exitCode;
+            string pkgDump = RunCommand(adbExe, string.Format("-s {0} shell dumpsys package {1}", serial, PackageName), 3000, out exitCode);
+            bool alreadyCurrent = !string.IsNullOrEmpty(pkgDump) &&
+                pkgDump.IndexOf(ExpectedVersionCodeMarker, StringComparison.OrdinalIgnoreCase) >= 0 &&
+                pkgDump.IndexOf("Unable to find package", StringComparison.OrdinalIgnoreCase) < 0;
+
+            if (!alreadyCurrent)
+            {
+                string tempApk = Path.Combine(Path.GetTempPath(), "PhoneAudioReceiver_v2.apk");
+                using (Stream res = OpenEmbeddedApkStream())
+                {
+                    if (res == null)
+                    {
+                        status = "APK receptor embutido não encontrado no executável.";
+                        return false;
+                    }
+                    using (var fs = new FileStream(tempApk, FileMode.Create, FileAccess.Write, FileShare.Read))
+                    {
+                        byte[] buf = new byte[16384];
+                        int n;
+                        while ((n = res.Read(buf, 0, buf.Length)) > 0)
+                        {
+                            fs.Write(buf, 0, n);
                         }
                     }
                 }
 
-                if (!hasOnlineDevice)
+                string instOut = RunCommand(adbExe, string.Format("-s {0} install -r -g \"{1}\"", serial, tempApk), 25000, out exitCode);
+                if (exitCode != 0 || instOut.IndexOf("Success", StringComparison.OrdinalIgnoreCase) < 0)
                 {
-                    statusMessage = "Nenhum celular Android com Depuração USB conectado";
+                    status = "Falha ao instalar receptor no celular: " + instOut.Trim();
                     return false;
                 }
-
-                string revArgs = string.Format("reverse tcp:{0} tcp:{0}", port);
-                RunShortCommand(adb, revArgs, 1800);
-                statusMessage = string.Format("Túnel ADB ativo (tcp:{0} -> tcp:{0})", port);
-                return true;
             }
-            catch (Exception ex)
+
+            // Best-effort notification & doze whitelist for reliable background FGS playback
+            RunCommand(adbExe, string.Format("-s {0} shell pm grant {1} android.permission.POST_NOTIFICATIONS", serial, PackageName), 2000, out exitCode);
+            RunCommand(adbExe, string.Format("-s {0} shell cmd deviceidle whitelist +{1}", serial, PackageName), 2000, out exitCode);
+
+            status = alreadyCurrent ? "Receptor nativo v2.0 já instalado." : "Receptor nativo v2.0 instalado no celular!";
+            return true;
+        }
+
+        public static bool SetupForwardAndLaunch(string adbExe, string serial, int localPort, int targetMs, int sampleRate, int gainPct, out string error)
+        {
+            error = "";
+            int exitCode;
+
+            string fwdArgs = string.Format("-s {0} forward tcp:{1} {2}", serial, localPort, AbstractSocket);
+            string fwdOut = RunCommand(adbExe, fwdArgs, 2500, out exitCode);
+            if (exitCode != 0)
             {
-                statusMessage = "Erro ADB: " + ex.Message;
+                error = "Falha ao abrir túnel adb forward: " + fwdOut.Trim();
                 return false;
+            }
+
+            string startArgs = string.Format(
+                "-s {0} shell am start -W -n {1} --ei target_ms {2} --ei sample_rate {3} --ei gain_pct {4}",
+                serial,
+                ActivityName,
+                targetMs,
+                sampleRate,
+                gainPct);
+            string startOut = RunCommand(adbExe, startArgs, 5000, out exitCode);
+            if (exitCode != 0 || startOut.IndexOf("Error:", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                error = "Falha ao iniciar app receptor no celular: " + startOut.Trim();
+                return false;
+            }
+
+            return true;
+        }
+
+        public static void RemoveForward(string adbExe, string serial, int localPort)
+        {
+            if (string.IsNullOrEmpty(adbExe) || string.IsNullOrEmpty(serial)) return;
+            try
+            {
+                int exitCode;
+                RunCommand(adbExe, string.Format("-s {0} forward --remove tcp:{1}", serial, localPort), 1500, out exitCode);
+            }
+            catch
+            {
             }
         }
 
-        private static string RunShortCommand(string exe, string args, int timeoutMs)
+        public static string RunCommand(string exe, string args, int timeoutMs, out int exitCode)
         {
+            exitCode = -1;
             var psi = new ProcessStartInfo
             {
                 FileName = exe,
@@ -1831,1367 +1514,209 @@ namespace PhoneAudioBridge
                 UseShellExecute = false,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
-                CreateNoWindow = true
+                CreateNoWindow = true,
+                StandardOutputEncoding = Encoding.UTF8,
+                StandardErrorEncoding = Encoding.UTF8
             };
             using (var proc = Process.Start(psi))
             {
                 if (proc == null) return "";
-                string output = proc.StandardOutput.ReadToEnd();
-                proc.WaitForExit(timeoutMs);
-                return output ?? "";
+                string stdout = proc.StandardOutput.ReadToEnd();
+                string stderr = proc.StandardError.ReadToEnd();
+                if (!proc.WaitForExit(timeoutMs))
+                {
+                    try { proc.Kill(); } catch { }
+                    return stdout + "\n" + stderr + "\n[TIMEOUT]";
+                }
+                exitCode = proc.ExitCode;
+                return (stdout + "\n" + stderr).Trim();
             }
         }
+    }
 
-        public static List<NetEndpointOption> DiscoverEndpoints(bool includeAdbActive)
+    #endregion
+
+    #region Native Binary USB Client
+
+    internal sealed class NativeUsbAudioClient : IDisposable
+    {
+        private const int MaxQueueSize = 24;
+
+        private readonly object _queueLock = new object();
+        private readonly Queue<byte[]> _sendQueue = new Queue<byte[]>();
+        private readonly AutoResetEvent _signal = new AutoResetEvent(false);
+
+        private TcpClient _tcp;
+        private NetworkStream _stream;
+        private Thread _writerThread;
+        private Thread _readerThread;
+        private volatile bool _closed;
+        private volatile bool _connected;
+        private uint _seqCounter;
+
+        private readonly Stopwatch _pingWatch = Stopwatch.StartNew();
+        public volatile int LatestRttMs;
+        public ReceiverStats LatestStats { get { lock (_statsLock) { return _latestStats; } } }
+        private readonly object _statsLock = new object();
+        private ReceiverStats _latestStats;
+
+        public Action<ReceiverStats> OnStatsReceived;
+        public Action<int, string> OnDisconnected;
+
+        public bool IsConnected { get { return _connected && !_closed; } }
+
+        public bool Connect(string host, int port, int sampleRate, int targetMs, int gainPct, out string error)
         {
-            var list = new List<NetEndpointOption>();
-            var seenIps = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            error = "";
+            DateTime deadline = DateTime.UtcNow.AddMilliseconds(4000);
+            Exception lastEx = null;
 
-            if (includeAdbActive)
+            while (DateTime.UtcNow < deadline && !_closed)
             {
-                list.Add(new NetEndpointOption
+                TcpClient candidate = null;
+                NetworkStream stream = null;
+                try
                 {
-                    InterfaceName = "Túnel ADB",
-                    Description = "Android Debug Bridge Reverse",
-                    IpAddress = "127.0.0.1",
-                    IsUsb = true,
-                    IsAdb = true,
-                    IsVirtual = false
-                });
-                seenIps.Add("127.0.0.1");
-            }
+                    candidate = new TcpClient();
+                    candidate.NoDelay = true;
+                    candidate.SendBufferSize = 65536;
+                    candidate.ReceiveTimeout = 700;
+                    candidate.SendTimeout = 2000;
+                    candidate.Connect(host, port);
+                    stream = candidate.GetStream();
 
-            try
-            {
-                NetworkInterface[] nics = NetworkInterface.GetAllNetworkInterfaces();
-                for (int i = 0; i < nics.Length; i++)
-                {
-                    NetworkInterface nic = nics[i];
-                    if (nic.OperationalStatus != OperationalStatus.Up) continue;
-                    if (nic.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
+                    // Send CONFIG (0x01) + initial PING (0x05) and wait briefly for PONG/STATS
+                    // to prove Android's localabstract:phoneaudiobridge accepted via adb forward.
+                    byte[] cfg = BuildConfigFrame(sampleRate, targetMs, gainPct);
+                    byte[] ping = BuildPingFrame(_pingWatch.ElapsedTicks);
+                    stream.Write(cfg, 0, cfg.Length);
+                    stream.Write(ping, 0, ping.Length);
+                    stream.Flush();
 
-                    string combined = ((nic.Name ?? "") + " " + (nic.Description ?? "")).ToLowerInvariant();
-                    bool isUsb = ContainsAny(combined, UsbKeywords);
-                    bool isVirtual = !isUsb && ContainsAny(combined, VirtualKeywords);
-
-                    IPInterfaceProperties ipProps = nic.GetIPProperties();
-                    UnicastIPAddressInformationCollection addrs = ipProps.UnicastAddresses;
-                    for (int j = 0; j < addrs.Count; j++)
+                    byte[] hdr = new byte[3];
+                    if (ReadExactInto(stream, hdr, 3))
                     {
-                        IPAddress ip = addrs[j].Address;
-                        if (ip.AddressFamily != AddressFamily.InterNetwork) continue;
-                        string ipStr = ip.ToString();
-                        if (ipStr.StartsWith("169.254.", StringComparison.Ordinal)) continue;
-                        if (ipStr == "127.0.0.1") continue;
-
-                        if (!isUsb && ipStr.StartsWith("192.168.42.", StringComparison.Ordinal))
+                        byte msgType = hdr[0];
+                        ushort msgLen = BridgeProtocol.ReadU16(hdr, 1);
+                        byte[] payload = msgLen > 0 ? new byte[msgLen] : new byte[0];
+                        if (msgLen == 0 || ReadExactInto(stream, payload, msgLen))
                         {
-                            isUsb = true;
+                            HandleInboundMessage(msgType, payload);
+                            candidate.ReceiveTimeout = 5000;
+                            _tcp = candidate;
+                            _stream = stream;
+                            _connected = true;
+                            StartThreads();
+                            return true;
                         }
-
-                        if (!seenIps.Add(ipStr)) continue;
-
-                        list.Add(new NetEndpointOption
-                        {
-                            InterfaceName = nic.Name ?? "Rede",
-                            Description = nic.Description ?? "",
-                            IpAddress = ipStr,
-                            IsUsb = isUsb,
-                            IsAdb = false,
-                            IsVirtual = isVirtual
-                        });
                     }
                 }
-            }
-            catch
-            {
-            }
-
-            list.Sort(delegate(NetEndpointOption a, NetEndpointOption b)
-            {
-                int ra = EndpointRank(a);
-                int rb = EndpointRank(b);
-                if (ra != rb) return ra.CompareTo(rb);
-                return string.Compare(a.IpAddress, b.IpAddress, StringComparison.Ordinal);
-            });
-
-            if (list.Count == 0)
-            {
-                list.Add(new NetEndpointOption
+                catch (Exception ex)
                 {
-                    InterfaceName = "Localhost",
-                    Description = "Nenhuma rede externa detectada",
-                    IpAddress = "127.0.0.1",
-                    IsUsb = false,
-                    IsAdb = false,
-                    IsVirtual = false
-                });
+                    lastEx = ex;
+                }
+
+                try { if (stream != null) stream.Close(); } catch { }
+                try { if (candidate != null) candidate.Close(); } catch { }
+                Thread.Sleep(150);
             }
 
-            return list;
-        }
-
-        private static int EndpointRank(NetEndpointOption opt)
-        {
-            if (opt.IsAdb) return 0;
-            if (opt.IsUsb) return 1;
-            if (!opt.IsVirtual) return 2;
-            return 3;
-        }
-
-        private static bool ContainsAny(string text, string[] keywords)
-        {
-            for (int i = 0; i < keywords.Length; i++)
-            {
-                if (text.Contains(keywords[i])) return true;
-            }
+            error = lastEx != null
+                ? ("Falha na conexão USB nativa: " + lastEx.Message)
+                : "O receptor Android não abriu o canal USB dentro do tempo limite.";
             return false;
         }
 
-        public static bool IsFirewallRulePresent(int port)
+        private void StartThreads()
         {
+            _writerThread = new Thread(WriterLoop);
+            _writerThread.IsBackground = true;
+            _writerThread.Priority = ThreadPriority.Highest;
+            _writerThread.Name = "USB-Native-Writer";
+            _writerThread.Start();
+
+            _readerThread = new Thread(ReaderLoop);
+            _readerThread.IsBackground = true;
+            _readerThread.Name = "USB-Native-Reader";
+            _readerThread.Start();
+        }
+
+        public void EnqueuePcm(byte[] pcm)
+        {
+            if (!_connected || _closed || pcm == null || pcm.Length == 0) return;
+
+            uint seq = unchecked(++_seqCounter);
+            int payloadLen = 4 + pcm.Length;
+            byte[] frame = new byte[3 + payloadLen];
+            frame[0] = BridgeProtocol.MsgPcm;
+            BridgeProtocol.WriteU16(frame, 1, (ushort)payloadLen);
+            BridgeProtocol.WriteU32(frame, 3, seq);
+            Buffer.BlockCopy(pcm, 0, frame, 7, pcm.Length);
+
+            lock (_queueLock)
+            {
+                if (_closed) return;
+                while (_sendQueue.Count >= MaxQueueSize)
+                {
+                    _sendQueue.Dequeue();
+                }
+                _sendQueue.Enqueue(frame);
+            }
+            _signal.Set();
+        }
+
+        public void SendTargetMs(int targetMs)
+        {
+            if (!_connected || _closed) return;
+            if (targetMs < 1) targetMs = 1;
+            if (targetMs > 120) targetMs = 120;
+
+            byte[] frame = new byte[5];
+            frame[0] = BridgeProtocol.MsgSetTargetMs;
+            BridgeProtocol.WriteU16(frame, 1, 2);
+            BridgeProtocol.WriteU16(frame, 3, (ushort)targetMs);
+            EnqueueControlFrame(frame);
+        }
+
+        public void SendGainPct(int gainPct)
+        {
+            if (!_connected || _closed) return;
+            if (gainPct < 0) gainPct = 0;
+            if (gainPct > 150) gainPct = 150;
+
+            byte[] frame = new byte[5];
+            frame[0] = BridgeProtocol.MsgSetGain;
+            BridgeProtocol.WriteU16(frame, 1, 2);
+            BridgeProtocol.WriteU16(frame, 3, (ushort)gainPct);
+            EnqueueControlFrame(frame);
+        }
+
+        public void SendPing()
+        {
+            if (!_connected || _closed) return;
+            EnqueueControlFrame(BuildPingFrame(_pingWatch.ElapsedTicks));
+        }
+
+        public void SendStopAndClose()
+        {
+            if (_closed) return;
             try
             {
-                string ruleName = "PhoneAudioBridge TCP " + port;
-                var psi = new ProcessStartInfo
+                if (_stream != null && _connected)
                 {
-                    FileName = "netsh",
-                    Arguments = string.Format("advfirewall firewall show rule name=\"{0}\"", ruleName),
-                    UseShellExecute = false,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    CreateNoWindow = true
-                };
-                using (var proc = Process.Start(psi))
-                {
-                    if (proc == null) return false;
-                    string stdout = proc.StandardOutput.ReadToEnd();
-                    proc.WaitForExit(2000);
-                    return proc.ExitCode == 0 && !string.IsNullOrEmpty(stdout) && stdout.Contains(port.ToString());
+                    byte[] stopFrame = new byte[] { BridgeProtocol.MsgStop, 0, 0 };
+                    _stream.Write(stopFrame, 0, stopFrame.Length);
+                    _stream.Flush();
                 }
             }
             catch
             {
-                return false;
             }
+            CloseInternal(0, "Sessão encerrada pelo PC.", false);
         }
 
-        public static bool AddFirewallRuleElevated(int port, out string error)
+        private void EnqueueControlFrame(byte[] frame)
         {
-            error = "";
-            try
-            {
-                string ruleName = "PhoneAudioBridge TCP " + port;
-                string cmdArgs = string.Format(
-                    "/c netsh advfirewall firewall delete rule name=\"{0}\" >nul 2>&1 & netsh advfirewall firewall add rule name=\"{0}\" dir=in action=allow protocol=TCP localport={1} profile=any",
-                    ruleName,
-                    port);
-
-                var psi = new ProcessStartInfo
-                {
-                    FileName = "cmd.exe",
-                    Arguments = cmdArgs,
-                    Verb = "runas",
-                    UseShellExecute = true,
-                    WindowStyle = ProcessWindowStyle.Hidden
-                };
-                using (var proc = Process.Start(psi))
-                {
-                    if (proc != null)
-                    {
-                        proc.WaitForExit(10000);
-                        return proc.ExitCode == 0;
-                    }
-                }
-                return false;
-            }
-            catch (Exception ex)
-            {
-                error = ex.Message;
-                return false;
-            }
-        }
-    }
-
-    #endregion
-
-    #region Embedded Mobile Web Player HTML
-
-    internal static class MobilePlayerHtml
-    {
-        public static string BuildPage()
-        {
-            return @"<!DOCTYPE html>
-<html lang=""pt-BR"">
-<head>
-<meta charset=""utf-8"">
-<meta name=""viewport"" content=""width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"">
-<meta name=""theme-color"" content=""#0f131a"">
-<title>Phone Audio Bridge</title>
-<style>
-:root{
-  --bg:#0f131a;--card:#181e29;--card2:#1f2736;--border:#2b364a;
-  --text:#f1f5f9;--muted:#94a3b8;--green:#22c55e;--blue:#38bdf8;--amber:#f59e0b;--red:#ef4444;
-}
-*{box-sizing:border-box;-webkit-tap-highlight-color:transparent;}
-body{margin:0;padding:16px;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;min-height:100vh;display:flex;flex-direction:column;align-items:center;}
-.wrap{width:100%;max-width:440px;display:flex;flex-direction:column;gap:14px;}
-.header{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:4px 2px;}
-.title{font-size:20px;font-weight:700;letter-spacing:-0.3px;}
-.badge{font-size:11px;font-weight:700;padding:5px 10px;border-radius:999px;background:rgba(56,189,248,0.16);color:var(--blue);border:1px solid rgba(56,189,248,0.35);text-transform:uppercase;}
-.badge.usb{background:rgba(34,197,94,0.16);color:var(--green);border-color:rgba(34,197,94,0.4);}
-.card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:16px;}
-.status-row{display:flex;align-items:center;gap:10px;margin-bottom:12px;}
-.dot{width:11px;height:11px;border-radius:50%;background:var(--muted);flex-shrink:0;}
-.dot.live{background:var(--green);box-shadow:0 0 10px rgba(34,197,94,0.8);}
-.dot.wait{background:var(--amber);}
-.dot.err{background:var(--red);}
-.status-text{font-size:14px;font-weight:600;}
-.sub{font-size:12px;color:var(--muted);margin-top:2px;}
-.btn-main{width:100%;padding:16px;border-radius:14px;border:none;font-size:16px;font-weight:700;cursor:pointer;background:linear-gradient(135deg,#22c55e,#16a34a);color:#06210f;box-shadow:0 6px 20px rgba(34,197,94,0.28);transition:transform .08s,opacity .15s;}
-.btn-main:active{transform:scale(0.985);}
-.btn-main.stop{background:linear-gradient(135deg,#ef4444,#dc2626);color:#fff;box-shadow:0 6px 20px rgba(239,68,68,0.25);}
-.meter-bg{height:8px;background:#0b0e14;border-radius:999px;overflow:hidden;margin-top:14px;border:1px solid #222b3b;}
-.meter-fill{height:100%;width:0%;background:linear-gradient(90deg,#22c55e,#38bdf8);transition:width 45ms linear;}
-.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
-.stat{background:var(--card2);border-radius:12px;padding:10px 12px;border:1px solid rgba(255,255,255,0.04);}
-.stat-lbl{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.4px;}
-.stat-val{font-size:17px;font-weight:700;margin-top:3px;font-variant-numeric:tabular-nums;}
-.ctrl{margin-bottom:14px;}
-.ctrl:last-child{margin-bottom:0;}
-.ctrl-head{display:flex;justify-content:space-between;align-items:center;font-size:13px;font-weight:600;margin-bottom:6px;}
-.ctrl-val{color:var(--blue);font-variant-numeric:tabular-nums;}
-input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
-.presets{display:flex;gap:8px;margin-top:8px;}
-.chip{flex:1;padding:8px 6px;border-radius:10px;border:1px solid var(--border);background:var(--card2);color:var(--text);font-size:12px;font-weight:600;cursor:pointer;}
-.chip.active{border-color:var(--green);background:rgba(34,197,94,0.14);color:var(--green);}
-.row-between{display:flex;align-items:center;justify-content:space-between;gap:10px;}
-.switch-btn{padding:8px 12px;border-radius:10px;border:1px solid var(--border);background:var(--card2);color:var(--text);font-size:12px;font-weight:600;cursor:pointer;}
-.switch-btn.on{border-color:var(--blue);color:var(--blue);background:rgba(56,189,248,0.14);}
-.tip{font-size:12px;line-height:1.45;color:var(--muted);}
-</style>
-</head>
-<body>
-<div class=""wrap"">
-  <div class=""header"">
-    <div class=""title"">Phone Audio Bridge</div>
-    <div id=""modeBadge"" class=""badge"">WI-FI</div>
-  </div>
-
-  <div class=""card"">
-    <div class=""status-row"">
-      <div id=""dot"" class=""dot""></div>
-      <div>
-        <div id=""statusText"" class=""status-text"">Pronto para conectar</div>
-        <div id=""deviceText"" class=""sub"">Conecte seu fone Bluetooth no celular e toque abaixo</div>
-      </div>
-    </div>
-    <button id=""playBtn"" class=""btn-main"" type=""button"">Conectar e Ouvir Áudio</button>
-    <div class=""meter-bg""><div id=""meterFill"" class=""meter-fill""></div></div>
-  </div>
-
-  <div class=""grid"">
-    <div class=""stat"">
-      <div class=""stat-lbl"">Latência Buffer</div>
-      <div id=""bufStat"" class=""stat-val"">-- ms</div>
-    </div>
-    <div class=""stat"">
-      <div class=""stat-lbl"">Ping Rede/USB</div>
-      <div id=""rttStat"" class=""stat-val"">-- ms</div>
-    </div>
-    <div class=""stat"">
-      <div class=""stat-lbl"">Formato</div>
-      <div id=""fmtStat"" class=""stat-val"">48kHz Estéreo</div>
-    </div>
-    <div class=""stat"">
-      <div class=""stat-lbl"">Resyncs</div>
-      <div id=""dropStat"" class=""stat-val"">0</div>
-    </div>
-  </div>
-
-  <div class=""card"">
-    <div class=""ctrl"">
-      <div class=""ctrl-head"">
-        <span>Buffer Alvo (menor = menos atraso)</span>
-        <span id=""bufLbl"" class=""ctrl-val"">60 ms</span>
-      </div>
-      <input id=""bufSlider"" type=""range"" min=""10"" max=""180"" step=""5"" value=""60"">
-      <div class=""presets"">
-        <button class=""chip"" data-ms=""10"" type=""button"">Ultra 10ms</button>
-        <button class=""chip"" data-ms=""15"" type=""button"">USB 15ms</button>
-        <button class=""chip"" data-ms=""60"" type=""button"">Wi-Fi 60ms</button>
-      </div>
-    </div>
-    <div class=""ctrl"">
-      <div class=""ctrl-head"">
-        <span>Volume no Celular</span>
-        <span id=""volLbl"" class=""ctrl-val"">100%</span>
-      </div>
-      <input id=""volSlider"" type=""range"" min=""0"" max=""150"" step=""5"" value=""100"">
-    </div>
-    <div class=""row-between"">
-      <span style=""font-size:13px;font-weight:600;"">Seguir modo do PC automático</span>
-      <button id=""autoModeBtn"" class=""switch-btn on"" type=""button"">Ativo</button>
-    </div>
-    <div class=""row-between"" style=""margin-top:10px;"">
-      <span style=""font-size:13px;font-weight:600;"">Manter tela acesa</span>
-      <button id=""wakeBtn"" class=""switch-btn"" type=""button"">Desativado</button>
-    </div>
-  </div>
-
-  <div class=""card tip"">
-    Dica: no <b>Cabo USB</b> (15 ms), use <b>Túnel ADB</b> para ativar o <b>AudioWorklet (2,7 ms)</b> no Chrome. No Wi-Fi, 55–75 ms mantém estabilidade mesmo com oscilação do roteador. Lembre também que o próprio fone Bluetooth adiciona ~100–200 ms dependendo do codec/Modo Jogo do fone.
-  </div>
-</div>
-
-<script>
-(function(){
-  var params = new URLSearchParams(location.search);
-  var initialMode = params.get('mode') === 'usb' ? 'usb' : 'wifi';
-
-  var playBtn = document.getElementById('playBtn');
-  var dot = document.getElementById('dot');
-  var statusText = document.getElementById('statusText');
-  var deviceText = document.getElementById('deviceText');
-  var modeBadge = document.getElementById('modeBadge');
-  var meterFill = document.getElementById('meterFill');
-  var bufStat = document.getElementById('bufStat');
-  var rttStat = document.getElementById('rttStat');
-  var fmtStat = document.getElementById('fmtStat');
-  var dropStat = document.getElementById('dropStat');
-  var bufSlider = document.getElementById('bufSlider');
-  var bufLbl = document.getElementById('bufLbl');
-  var volSlider = document.getElementById('volSlider');
-  var volLbl = document.getElementById('volLbl');
-  var autoModeBtn = document.getElementById('autoModeBtn');
-  var wakeBtn = document.getElementById('wakeBtn');
-  var chips = document.querySelectorAll('.chip');
-
-  var running = false;
-  var ws = null;
-  var netWorker = null;
-  var ctx = null;
-  var gainNode = null;
-  var silentInGain = null;
-  var audioNode = null;
-  var workletLoaded = false;
-  var workletLoading = false;
-  var useWorklet = false;
-  var workerPipelineActive = false;
-  var engineLabel = 'Ring';
-  var dspFallback = null;
-  var pendingFrames = [];
-  var telemetryTimer = null;
-  var keepAliveAudio = null;
-  var wakeLock = null;
-  var pingTimer = null;
-  var wasAudioRunning = false;
-  var keepAlivePlaying = false;
-  var intentionalPause = false;
-  var latestWsGapMax = 0;
-  var latestRttMs = 0;
-  var lastStatSendTime = 0;
-
-  var sampleRate = 48000;
-  var targetBufferMs = initialMode === 'usb' ? 15 : 60;
-  var maxBufferMs = initialMode === 'usb' ? 55 : 160;
-  var autoFollowPc = true;
-
-  function createRingDspEngine(outRate) {
-    var CAP = 16384;
-    var MASK = 16383;
-    var ringL = new Float32Array(CAP);
-    var ringR = new Float32Array(CAP);
-    var srcRate = 48000;
-    var targetMs = 15;
-    var maxMs = 55;
-    var pktFrames = 480;
-    var writePos = 0;
-    var readPos = 0;
-    var primed = false;
-    var avgAvail = 0;
-    var integral = 0;
-    var smoothedRate = srcRate / (outRate || 48000);
-    var plcMode = false;
-    var plcFrames = 0;
-    var plcAnchor = 0;
-    var plcStep = 1;
-    var plcGain = 1.0;
-    var fadeLen = 48;
-    var fadeRem = 0;
-    var prevOutL = 0;
-    var prevOutR = 0;
-    var resyncCount = 0;
-    var plcEvents = 0;
-    var plcDelta = 0;
-    var minAvailFrames = 999999;
-    var smoothLevel = 0;
-    var lastBufMs = 0;
-    var lastMinBufMs = 0;
-
-    function startFade(len) {
-      fadeLen = len > 0 ? len : 1;
-      fadeRem = fadeLen;
-    }
-
-    function reset() {
-      writePos = 0;
-      readPos = 0;
-      primed = false;
-      avgAvail = 0;
-      integral = 0;
-      smoothedRate = srcRate / (outRate || 48000);
-      plcMode = false;
-      plcFrames = 0;
-      plcStep = 1;
-      plcGain = 1.0;
-      fadeLen = 48;
-      fadeRem = 0;
-      prevOutL = 0;
-      prevOutR = 0;
-      plcDelta = 0;
-      minAvailFrames = 999999;
-      smoothLevel = 0;
-      lastBufMs = 0;
-      lastMinBufMs = 0;
-    }
-
-    function setConfig(sr, tMs, mMs) {
-      if (sr && sr !== srcRate) {
-        srcRate = sr;
-        smoothedRate = srcRate / (outRate || 48000);
-      }
-      if (tMs) targetMs = tMs;
-      if (mMs) maxMs = mMs;
-    }
-
-    function setBufferTargets(tMs, mMs) {
-      if (tMs) targetMs = tMs;
-      if (mMs) maxMs = mMs;
-    }
-
-    function pushInt16Bytes(ab) {
-      if (!ab || ab.byteLength <= 8) return;
-      var frames = ((ab.byteLength - 8) / 4) | 0;
-      if (frames <= 0) return;
-      pktFrames = frames;
-      var i16 = new Int16Array(ab, 8, frames * 2);
-      var peak = 0;
-      var w = writePos;
-      for (var i = 0; i < frames; i++) {
-        var l = i16[i * 2] / 32768;
-        var r = i16[i * 2 + 1] / 32768;
-        var idx = w & MASK;
-        ringL[idx] = l;
-        ringR[idx] = r;
-        w++;
-        var a = l < 0 ? -l : l;
-        if (a > peak) peak = a;
-      }
-      writePos = w;
-      smoothLevel = smoothLevel * 0.65 + Math.min(1, peak * 1.4) * 0.35;
-
-      var targetFrames = Math.max(96, Math.round((targetMs * srcRate) / 1000));
-      var primeFrames = targetFrames + (pktFrames >> 1);
-      if (!primed) {
-        if ((writePos - Math.floor(readPos)) >= primeFrames) {
-          primed = true;
-          readPos = writePos - primeFrames;
-          avgAvail = targetFrames;
-          minAvailFrames = targetFrames;
-          integral = 0;
-          smoothedRate = srcRate / (outRate || 48000);
-          startFade(48);
-          prevOutL = 0;
-          prevOutR = 0;
-        }
-      } else if ((writePos - readPos) > (CAP - 1024)) {
-        readPos = writePos - primeFrames;
-        startFade(48);
-        avgAvail = targetFrames;
-        integral = 0;
-        resyncCount++;
-      }
-
-      if (readPos > 100000000 && writePos > 100000000) {
-        var shift = CAP * 1000;
-        readPos -= shift;
-        writePos -= shift;
-        plcAnchor -= shift;
-      }
-    }
-
-    function hermite(arr, idxInt, f) {
-      var y0 = arr[(idxInt - 1) & MASK];
-      var y1 = arr[idxInt & MASK];
-      var y2 = arr[(idxInt + 1) & MASK];
-      var y3 = arr[(idxInt + 2) & MASK];
-      var c0 = y1;
-      var c1 = 0.5 * (y2 - y0);
-      var c2 = y0 - 2.5 * y1 + 2.0 * y2 - 0.5 * y3;
-      var c3 = 0.5 * (y3 - y0) + 1.5 * (y1 - y2);
-      return ((c3 * f + c2) * f + c1) * f + c0;
-    }
-
-    function renderBlock(outL, outR) {
-      var n = outL.length;
-      if (!primed) {
-        for (var z = 0; z < n; z++) {
-          outL[z] = 0;
-          if (outR !== outL) outR[z] = 0;
-        }
-        lastBufMs = Math.round((Math.max(0, writePos - readPos) * 1000) / srcRate);
-        return;
-      }
-
-      var targetFrames = Math.max(96, (targetMs * srcRate) / 1000);
-      var maxFrames = Math.max((maxMs * srcRate) / 1000, targetFrames + Math.round(srcRate * 0.030));
-      var availNow = writePos - readPos;
-      if (availNow > maxFrames) {
-        readPos = writePos - (targetFrames + (pktFrames >> 1));
-        startFade(48);
-        avgAvail = targetFrames;
-        integral = 0;
-        resyncCount++;
-        availNow = targetFrames;
-      }
-
-      var avail = Math.max(0, availNow);
-      if (avail < minAvailFrames) minAvailFrames = avail;
-      var availMid = Math.max(0, avail - n * 0.5);
-      avgAvail = avgAvail * 0.94 + availMid * 0.06;
-      var dt = n / (outRate || 48000);
-      var errSec = (avgAvail - targetFrames) / srcRate;
-      integral += errSec * dt;
-      if (integral > 0.02) integral = 0.02;
-      if (integral < -0.02) integral = -0.02;
-
-      var corr = errSec * 0.45 + integral * 0.12;
-      if (corr > 0.014) corr = 0.014;
-      if (corr < -0.014) corr = -0.014;
-
-      var targetRate = (srcRate / (outRate || 48000)) * (1.0 + corr);
-      smoothedRate = smoothedRate * 0.88 + targetRate * 0.12;
-
-      var maxPlcDecayFrames = Math.round(srcRate * 0.028);
-      var maxPlcResetFrames = Math.round(srcRate * 0.085);
-
-      for (var i = 0; i < n; i++) {
-        var curAvail = writePos - readPos;
-        if (curAvail < minAvailFrames) minAvailFrames = Math.max(0, curAvail);
-        if (readPos + 1.0 < writePos) {
-          if (plcMode) {
-            plcMode = false;
-            plcFrames = 0;
-            startFade(32);
-          }
-          var idx = Math.floor(readPos);
-          var frac = readPos - idx;
-          var sL;
-          var sR;
-          if (idx + 2 < writePos) {
-            sL = hermite(ringL, idx, frac);
-            sR = hermite(ringR, idx, frac);
-          } else {
-            var i0 = idx & MASK;
-            var i1 = (idx + 1) & MASK;
-            sL = ringL[i0] + (ringL[i1] - ringL[i0]) * frac;
-            sR = ringR[i0] + (ringR[i1] - ringR[i0]) * frac;
-          }
-          if (fadeRem > 0) {
-            var t = (fadeLen - fadeRem) / fadeLen;
-            var w = 0.5 - 0.5 * Math.cos(Math.PI * t);
-            sL = prevOutL * (1.0 - w) + sL * w;
-            sR = prevOutR * (1.0 - w) + sR * w;
-            fadeRem--;
-          }
-          outL[i] = sL;
-          if (outR !== outL) outR[i] = sR;
-          prevOutL = sL;
-          prevOutR = sR;
-          readPos += smoothedRate;
-        } else {
-          minAvailFrames = 0;
-          if (!plcMode) {
-            plcMode = true;
-            plcFrames = 0;
-            plcAnchor = Math.max(0, writePos - 1);
-            plcStep = 1;
-            plcGain = 1.0;
-            plcEvents++;
-            plcDelta++;
-          }
-          plcFrames++;
-          if (plcFrames > maxPlcResetFrames) {
-            primed = false;
-            plcMode = false;
-            readPos = writePos;
-            resyncCount++;
-            for (var k = i; k < n; k++) {
-              prevOutL *= 0.9;
-              prevOutR *= 0.9;
-              outL[k] = prevOutL;
-              if (outR !== outL) outR[k] = prevOutR;
-            }
-            break;
-          } else if (plcFrames > maxPlcDecayFrames) {
-            prevOutL *= 0.92;
-            prevOutR *= 0.92;
-            outL[i] = prevOutL;
-            if (outR !== outL) outR[i] = prevOutR;
-          } else {
-            var mIdx = (plcAnchor - plcStep) & MASK;
-            plcStep++;
-            if (plcStep >= 160) plcStep = 1;
-            plcGain *= 0.993;
-            var mL = ringL[mIdx] * plcGain;
-            var mR = ringR[mIdx] * plcGain;
-            outL[i] = mL;
-            if (outR !== outL) outR[i] = mR;
-            prevOutL = mL;
-            prevOutR = mR;
-          }
-        }
-      }
-
-      lastBufMs = Math.max(0, Math.round(((writePos - readPos) * 1000) / srcRate));
-      if (minAvailFrames < 999999) {
-        lastMinBufMs = Math.max(0, Math.round((minAvailFrames * 1000) / srcRate));
-      } else {
-        lastMinBufMs = lastBufMs;
-      }
-    }
-
-    function getTelemetry() {
-      var curDelta = plcDelta;
-      plcDelta = 0;
-      minAvailFrames = Math.max(0, writePos - readPos);
-      return {
-        bufMs: lastBufMs,
-        minBufMs: lastMinBufMs,
-        resyncs: resyncCount,
-        plc: plcEvents,
-        plcDelta: curDelta,
-        level: smoothLevel
-      };
-    }
-
-    return {
-      reset: reset,
-      setConfig: setConfig,
-      setBufferTargets: setBufferTargets,
-      pushInt16Bytes: pushInt16Bytes,
-      renderBlock: renderBlock,
-      getTelemetry: getTelemetry
-    };
-  }
-
-  function applyModeBadge(mode) {
-    if (mode === 'usb') {
-      modeBadge.textContent = 'CABO USB';
-      modeBadge.className = 'badge usb';
-    } else {
-      modeBadge.textContent = 'WI-FI';
-      modeBadge.className = 'badge';
-    }
-  }
-
-  function updateBufferUi(ms, customMax) {
-    targetBufferMs = ms;
-    maxBufferMs = customMax ? customMax : Math.max(ms * 2 + 25, ms + 40);
-    bufSlider.value = String(ms);
-    bufLbl.textContent = ms + ' ms';
-    for (var i = 0; i < chips.length; i++) {
-      var cms = parseInt(chips[i].getAttribute('data-ms'), 10);
-      chips[i].className = cms === ms ? 'chip active' : 'chip';
-    }
-    if (useWorklet && audioNode && audioNode.port) {
-      audioNode.port.postMessage({ type: 'buf', targetMs: targetBufferMs, maxMs: maxBufferMs });
-    } else if (dspFallback) {
-      dspFallback.setBufferTargets(targetBufferMs, maxBufferMs);
-    }
-  }
-
-  applyModeBadge(initialMode);
-  updateBufferUi(targetBufferMs, maxBufferMs);
-
-  function setStatus(state, text, sub) {
-    dot.className = 'dot ' + state;
-    statusText.textContent = text;
-    if (sub !== undefined) deviceText.textContent = sub;
-  }
-
-  function buildSilentWavUrl() {
-    var sr = 8000, n = 8000;
-    var buf = new ArrayBuffer(44 + n * 2);
-    var dv = new DataView(buf);
-    function wsStr(o, s){ for (var i=0;i<s.length;i++) dv.setUint8(o+i, s.charCodeAt(i)); }
-    wsStr(0,'RIFF'); dv.setUint32(4, 36 + n*2, true); wsStr(8,'WAVE');
-    wsStr(12,'fmt '); dv.setUint32(16, 16, true); dv.setUint16(20, 1, true);
-    dv.setUint16(22, 1, true); dv.setUint32(24, sr, true); dv.setUint32(28, sr*2, true);
-    dv.setUint16(32, 2, true); dv.setUint16(34, 16, true); wsStr(36,'data'); dv.setUint32(40, n*2, true);
-    var blob = new Blob([buf], { type: 'audio/wav' });
-    return URL.createObjectURL(blob);
-  }
-
-  function stopKeepAlive() {
-    intentionalPause = true;
-    keepAlivePlaying = false;
-    try { if (keepAliveAudio) keepAliveAudio.pause(); } catch (e) {}
-  }
-
-  function updateFormatLabel() {
-    fmtStat.textContent = (Math.round(sampleRate / 100) / 10) + 'kHz · ' + engineLabel;
-  }
-
-  function sendStatsToPc(t) {
-    if (!running || !t) return;
-    var now = performance.now();
-    var elapsed = lastStatSendTime > 0 ? (now - lastStatSendTime) : 400;
-    lastStatSendTime = now;
-    var plcPerSec = Math.round(((t.plcDelta || 0) * 1000) / Math.max(120, elapsed));
-    var payload = JSON.stringify({
-      type: 'stats',
-      engine: engineLabel,
-      bufMs: t.bufMs,
-      minBufMs: t.minBufMs,
-      wsGapMaxMs: latestWsGapMax,
-      plc: t.plc,
-      plcPerSec: plcPerSec,
-      resyncs: t.resyncs,
-      rttMs: latestRttMs,
-      targetMs: targetBufferMs
-    });
-    if (!workerPipelineActive) latestWsGapMax = 0;
-    if (netWorker) {
-      try { netWorker.postMessage({ type: 'sendText', text: payload }); } catch (e) {}
-    } else if (ws && ws.readyState === 1) {
-      try { ws.send(payload); } catch (e) {}
-    }
-  }
-
-  function applyTelemetry(t) {
-    if (!t) return;
-    bufStat.textContent = t.bufMs + ' ms';
-    dropStat.textContent = String(t.resyncs) + (t.plc > 0 ? ' (PLC ' + t.plc + ')' : '');
-    meterFill.style.width = Math.round(Math.min(1, t.level) * 100) + '%';
-    sendStatsToPc(t);
-  }
-
-  function disconnectSession(state, title, sub) {
-    if (!running && !ws && !netWorker) {
-      setStatus(state, title, sub);
-      return;
-    }
-    running = false;
-    wasAudioRunning = false;
-    workerPipelineActive = false;
-    pendingFrames = [];
-    latestWsGapMax = 0;
-    lastStatSendTime = 0;
-    if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
-    if (telemetryTimer) { clearInterval(telemetryTimer); telemetryTimer = null; }
-    if (netWorker) {
-      try { netWorker.postMessage({ type: 'close' }); } catch (e) {}
-      try { netWorker.terminate(); } catch (e) {}
-      netWorker = null;
-    }
-    if (ws) {
-      try {
-        ws.onopen = null;
-        ws.onmessage = null;
-        ws.onclose = null;
-        ws.onerror = null;
-        ws.close();
-      } catch (e) {}
-      ws = null;
-    }
-    if (useWorklet && audioNode && audioNode.port) {
-      try { audioNode.port.postMessage({ type: 'stop' }); } catch (e) {}
-    } else if (dspFallback) {
-      dspFallback.reset();
-    }
-    if (ctx && ctx.state === 'running') {
-      try { ctx.suspend(); } catch (e) {}
-    }
-    stopKeepAlive();
-    if (wakeLock) {
-      try { wakeLock.release(); } catch (e) {}
-      wakeLock = null;
-      wakeBtn.className = 'switch-btn';
-      wakeBtn.textContent = 'Desativado';
-    }
-    playBtn.textContent = 'Conectar e Ouvir Áudio';
-    playBtn.className = 'btn-main';
-    meterFill.style.width = '0%';
-    bufStat.textContent = '-- ms';
-    rttStat.textContent = '-- ms';
-    setStatus(state, title, sub);
-  }
-
-  function startKeepAlive() {
-    try {
-      if (!keepAliveAudio) {
-        keepAliveAudio = document.createElement('audio');
-        keepAliveAudio.src = buildSilentWavUrl();
-        keepAliveAudio.loop = true;
-        keepAliveAudio.volume = 0.01;
-        keepAliveAudio.addEventListener('playing', function() {
-          if (running) keepAlivePlaying = true;
-        });
-        keepAliveAudio.addEventListener('pause', function() {
-          if (running && keepAlivePlaying && !intentionalPause) {
-            disconnectSession('', 'Desconectado (fone/Bluetooth removido)', 'Não reconecta sozinho. Toque acima quando quiser ouvir o PC novamente');
-          }
-        });
-      }
-      intentionalPause = false;
-      var p = keepAliveAudio.play();
-      if (p && p.catch) p.catch(function(){});
-      if ('mediaSession' in navigator) {
-        navigator.mediaSession.metadata = new MediaMetadata({
-          title: 'Áudio do PC ao Vivo',
-          artist: 'Phone Audio Bridge'
-        });
-      }
-    } catch (e) {}
-  }
-
-  function initScriptProcessorEngine() {
-    if (audioNode && !useWorklet && dspFallback) {
-      dspFallback.reset();
-      dspFallback.setConfig(sampleRate, targetBufferMs, maxBufferMs);
-      startScriptTelemetry();
-      flushPendingFrames();
-      return;
-    }
-    dspFallback = createRingDspEngine(ctx.sampleRate);
-    dspFallback.setConfig(sampleRate, targetBufferMs, maxBufferMs);
-    var sizes = initialMode === 'usb' ? [256, 512, 1024] : [512, 1024];
-    var sp = null;
-    var chosenSize = 512;
-    for (var i = 0; i < sizes.length; i++) {
-      try {
-        sp = ctx.createScriptProcessor(sizes[i], 1, 2);
-        chosenSize = sizes[i];
-        break;
-      } catch (e) {}
-    }
-    if (!sp) return;
-    if (!silentInGain) {
-      silentInGain = ctx.createGain();
-      silentInGain.gain.value = 0;
-    }
-    sp.onaudioprocess = function(ev) {
-      var outL = ev.outputBuffer.getChannelData(0);
-      var outR = ev.outputBuffer.getChannelData(1);
-      if (!running) {
-        outL.fill(0);
-        outR.fill(0);
-        return;
-      }
-      dspFallback.renderBlock(outL, outR);
-    };
-    silentInGain.connect(sp);
-    sp.connect(gainNode);
-    audioNode = sp;
-    useWorklet = false;
-    engineLabel = 'Ring ' + (Math.round((chosenSize * 10000) / ctx.sampleRate) / 10) + 'ms';
-    updateFormatLabel();
-    startScriptTelemetry();
-    flushPendingFrames();
-  }
-
-  function startScriptTelemetry() {
-    if (telemetryTimer) clearInterval(telemetryTimer);
-    telemetryTimer = setInterval(function() {
-      if (running && !useWorklet && dspFallback) {
-        applyTelemetry(dspFallback.getTelemetry());
-      }
-    }, 400);
-  }
-
-  function flushPendingFrames() {
-    if (!running || pendingFrames.length === 0) return;
-    for (var i = 0; i < pendingFrames.length; i++) {
-      dispatchAudioFrame(pendingFrames[i]);
-    }
-    pendingFrames = [];
-  }
-
-  function dispatchAudioFrame(ab) {
-    if (useWorklet && workletLoaded && audioNode && audioNode.port) {
-      audioNode.port.postMessage(ab, [ab]);
-    } else if (!useWorklet && dspFallback) {
-      dspFallback.pushInt16Bytes(ab);
-    } else {
-      if (pendingFrames.length < 16) pendingFrames.push(ab);
-    }
-  }
-
-  function buildWorkletCode() {
-    return 'var createRingDspEngine = ' + createRingDspEngine.toString() + ';\n' +
-      'class PhoneAudioBridgeWorklet extends AudioWorkletProcessor {\n' +
-      '  constructor() {\n' +
-      '    super();\n' +
-      '    this.dsp = createRingDspEngine(sampleRate);\n' +
-      '    this.active = false;\n' +
-      '    this.tick = 0;\n' +
-      '    this.netPort = null;\n' +
-      '    var self = this;\n' +
-      '    this.port.onmessage = function(ev) {\n' +
-      '      var d = ev.data;\n' +
-      '      if (d instanceof ArrayBuffer) {\n' +
-      '        if (self.active) self.dsp.pushInt16Bytes(d);\n' +
-      '      } else if (d && d.type === \'netPort\' && d.port) {\n' +
-      '        if (self.netPort) { try { self.netPort.onmessage = null; self.netPort.close(); } catch (e) {} }\n' +
-      '        self.netPort = d.port;\n' +
-      '        self.netPort.onmessage = function(nev) {\n' +
-      '          if (self.active && nev.data instanceof ArrayBuffer) self.dsp.pushInt16Bytes(nev.data);\n' +
-      '        };\n' +
-      '      } else if (d && d.type === \'cfg\') {\n' +
-      '        self.dsp.setConfig(d.sampleRate, d.targetMs, d.maxMs);\n' +
-      '      } else if (d && d.type === \'buf\') {\n' +
-      '        self.dsp.setBufferTargets(d.targetMs, d.maxMs);\n' +
-      '      } else if (d && d.type === \'start\') {\n' +
-      '        self.dsp.reset();\n' +
-      '        self.active = true;\n' +
-      '      } else if (d && d.type === \'stop\') {\n' +
-      '        self.active = false;\n' +
-      '        self.dsp.reset();\n' +
-      '      }\n' +
-      '    };\n' +
-      '  }\n' +
-      '  process(inputs, outputs) {\n' +
-      '    var out = outputs[0];\n' +
-      '    if (!out || out.length === 0) return true;\n' +
-      '    var outL = out[0];\n' +
-      '    var outR = out.length > 1 ? out[1] : null;\n' +
-      '    if (!this.active) {\n' +
-      '      outL.fill(0);\n' +
-      '      if (outR) outR.fill(0);\n' +
-      '      return true;\n' +
-      '    }\n' +
-      '    this.dsp.renderBlock(outL, outR || outL);\n' +
-      '    if (++this.tick >= 150) {\n' +
-      '      this.tick = 0;\n' +
-      '      this.port.postMessage(this.dsp.getTelemetry());\n' +
-      '    }\n' +
-      '    return true;\n' +
-      '  }\n' +
-      '}\n' +
-      'registerProcessor(\'phone-audio-bridge-proc\', PhoneAudioBridgeWorklet);\n';
-  }
-
-  function buildNetWorkerCode() {
-    return 'var ws = null;\n' +
-      'var audioPort = null;\n' +
-      'var loopbackAck = false;\n' +
-      'var ackBuf = new Uint8Array([6]);\n' +
-      'var pingTimer = null;\n' +
-      'var gapTimer = null;\n' +
-      'var lastBinMs = 0;\n' +
-      'var maxGapMs = 0;\n' +
-      'self.onmessage = function(ev) {\n' +
-      '  var d = ev.data;\n' +
-      '  if (!d) return;\n' +
-      '  if (d.type === \'init\') {\n' +
-      '    audioPort = d.audioPort;\n' +
-      '    loopbackAck = !!d.loopbackAck;\n' +
-      '    ws = new WebSocket(d.wsUrl);\n' +
-      '    ws.binaryType = \'arraybuffer\';\n' +
-      '    ws.onopen = function() {\n' +
-      '      self.postMessage({ type: \'open\' });\n' +
-      '      pingTimer = setInterval(function() {\n' +
-      '        if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: \'ping\', t: performance.now() }));\n' +
-      '      }, 2000);\n' +
-      '      gapTimer = setInterval(function() {\n' +
-      '        self.postMessage({ type: \'wsGap\', maxGapMs: maxGapMs });\n' +
-      '        maxGapMs = 0;\n' +
-      '      }, 400);\n' +
-      '      ws.send(JSON.stringify({ type: \'ping\', t: performance.now() }));\n' +
-      '    };\n' +
-      '    ws.onmessage = function(wev) {\n' +
-      '      if (typeof wev.data === \'string\') {\n' +
-      '        try {\n' +
-      '          var msg = JSON.parse(wev.data);\n' +
-      '          if (msg.type === \'pong\' && typeof msg.t === \'number\') {\n' +
-      '            self.postMessage({ type: \'rtt\', ms: Math.max(1, Math.round(performance.now() - msg.t)) });\n' +
-      '          } else if (msg.type === \'config\') {\n' +
-      '            self.postMessage({ type: \'config\', msg: msg });\n' +
-      '          }\n' +
-      '        } catch (e) {}\n' +
-      '      } else if (wev.data instanceof ArrayBuffer) {\n' +
-      '        var now = performance.now();\n' +
-      '        if (lastBinMs > 0) {\n' +
-      '          var dt = Math.round(now - lastBinMs);\n' +
-      '          if (dt > maxGapMs) maxGapMs = dt;\n' +
-      '        }\n' +
-      '        lastBinMs = now;\n' +
-      '        if (audioPort) audioPort.postMessage(wev.data, [wev.data]);\n' +
-      '        if (loopbackAck && ws && ws.readyState === 1) { try { ws.send(ackBuf); } catch (e) {} }\n' +
-      '      }\n' +
-      '    };\n' +
-      '    ws.onclose = function() {\n' +
-      '      if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }\n' +
-      '      if (gapTimer) { clearInterval(gapTimer); gapTimer = null; }\n' +
-      '      self.postMessage({ type: \'close\' });\n' +
-      '    };\n' +
-      '    ws.onerror = function() {\n' +
-      '      self.postMessage({ type: \'error\' });\n' +
-      '    };\n' +
-      '  } else if (d.type === \'sendText\' && ws && ws.readyState === 1) {\n' +
-      '    ws.send(d.text);\n' +
-      '  } else if (d.type === \'close\') {\n' +
-      '    if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }\n' +
-      '    if (gapTimer) { clearInterval(gapTimer); gapTimer = null; }\n' +
-      '    if (ws) { try { ws.onclose = null; ws.onerror = null; ws.close(); } catch (e) {} ws = null; }\n' +
-      '    if (audioPort) { try { audioPort.close(); } catch (e) {} audioPort = null; }\n' +
-      '  }\n' +
-      '};\n';
-  }
-
-  function handleConfigFromServer(msg) {
-    if (!msg) return;
-    if (msg.sampleRate) sampleRate = msg.sampleRate;
-    updateFormatLabel();
-    if (msg.device) deviceText.textContent = 'Fonte PC: ' + msg.device;
-    var tr = msg.transport || msg.mode;
-    if (tr) applyModeBadge(tr);
-    if (autoFollowPc && msg.targetBufferMs) {
-      updateBufferUi(msg.targetBufferMs, msg.maxBufferMs);
-    }
-    if (useWorklet && workletLoaded && audioNode && audioNode.port) {
-      audioNode.port.postMessage({ type: 'cfg', sampleRate: sampleRate, targetMs: targetBufferMs, maxMs: maxBufferMs });
-    } else if (dspFallback) {
-      dspFallback.setConfig(sampleRate, targetBufferMs, maxBufferMs);
-    }
-  }
-
-  function startWorkerWebSocket() {
-    if (!running) return;
-    if (netWorker) {
-      try { netWorker.terminate(); } catch (e) {}
-      netWorker = null;
-    }
-    var proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
-    var wsUrl = proto + location.host + '/ws';
-    var isLoopbackHost = (location.hostname === '127.0.0.1' || location.hostname === 'localhost');
-    setStatus('wait', 'Conectando ao PC...', 'Abrindo canal Worker + Worklet');
-    var ch = new MessageChannel();
-    audioNode.port.postMessage({ type: 'netPort', port: ch.port1 }, [ch.port1]);
-
-    var wUrl = URL.createObjectURL(new Blob([buildNetWorkerCode()], { type: 'application/javascript' }));
-    netWorker = new Worker(wUrl);
-    URL.revokeObjectURL(wUrl);
-    workerPipelineActive = true;
-    engineLabel = 'Worklet+Worker';
-    updateFormatLabel();
-
-    netWorker.onmessage = function(ev) {
-      var d = ev.data;
-      if (!d || !running) return;
-      if (d.type === 'open') {
-        setStatus('live', 'Conectado e recebendo áudio', 'Áudio pronto — toque algo no PC para ouvir');
-      } else if (d.type === 'rtt') {
-        latestRttMs = d.ms;
-        rttStat.textContent = d.ms + ' ms';
-      } else if (d.type === 'wsGap') {
-        latestWsGapMax = d.maxGapMs;
-      } else if (d.type === 'config') {
-        handleConfigFromServer(d.msg);
-      } else if (d.type === 'close') {
-        disconnectSession('', 'Conexão com o PC encerrada', 'Não reconecta sozinho. Toque acima quando quiser conectar novamente');
-      } else if (d.type === 'error') {
-        disconnectSession('err', 'Falha na conexão', 'Verifique se o app está aberto e o firewall liberado');
-      }
-    };
-
-    netWorker.postMessage({ type: 'init', wsUrl: wsUrl, audioPort: ch.port2, loopbackAck: isLoopbackHost }, [ch.port2]);
-  }
-
-  function startSessionPipeline() {
-    var AC = window.AudioContext || window.webkitAudioContext;
-    if (!ctx) {
-      try {
-        ctx = new AC({ latencyHint: 'interactive', sampleRate: sampleRate });
-      } catch (e) {
-        ctx = new AC();
-      }
-      gainNode = ctx.createGain();
-      gainNode.gain.value = parseInt(volSlider.value, 10) / 100;
-      gainNode.connect(ctx.destination);
-      ctx.onstatechange = function() {
-        if (!ctx) return;
-        if (ctx.state === 'running') {
-          wasAudioRunning = true;
-        } else if (running && wasAudioRunning && (ctx.state === 'suspended' || ctx.state === 'interrupted')) {
-          disconnectSession('', 'Desconectado (Bluetooth/áudio pausado)', 'Não reconecta sozinho. Toque acima quando quiser ouvir o PC novamente');
-        }
-      };
-    }
-
-    wasAudioRunning = (ctx.state === 'running');
-    if (ctx.state !== 'running') {
-      try {
-        var p = ctx.resume();
-        if (p && p.then) {
-          p.then(function() {
-            if (ctx && ctx.state === 'running') wasAudioRunning = true;
-          }).catch(function(){});
-        }
-      } catch (e) {}
-    }
-
-    var canWorklet = !!(window.isSecureContext && ctx.audioWorklet);
-    var canWorker = !!(canWorklet && window.Worker && window.MessageChannel);
-
-    if (canWorklet) {
-      if (workletLoaded && audioNode) {
-        useWorklet = true;
-        engineLabel = canWorker ? 'Worklet+Worker' : 'Worklet 2.7ms';
-        updateFormatLabel();
-        audioNode.port.postMessage({ type: 'cfg', sampleRate: sampleRate, targetMs: targetBufferMs, maxMs: maxBufferMs });
-        audioNode.port.postMessage({ type: 'start' });
-        if (canWorker) {
-          startWorkerWebSocket();
-        } else {
-          connectWsMainThread();
-        }
-        return;
-      }
-      if (!workletLoading) {
-        workletLoading = true;
-        useWorklet = true;
-        engineLabel = canWorker ? 'Worklet+Worker' : 'Worklet 2.7ms';
-        updateFormatLabel();
-        var blobUrl = URL.createObjectURL(new Blob([buildWorkletCode()], { type: 'application/javascript' }));
-        ctx.audioWorklet.addModule(blobUrl).then(function() {
-          URL.revokeObjectURL(blobUrl);
-          workletLoading = false;
-          workletLoaded = true;
-          audioNode = new AudioWorkletNode(ctx, 'phone-audio-bridge-proc', { numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [2] });
-          audioNode.port.onmessage = function(ev) {
-            if (running) applyTelemetry(ev.data);
-          };
-          audioNode.connect(gainNode);
-          audioNode.port.postMessage({ type: 'cfg', sampleRate: sampleRate, targetMs: targetBufferMs, maxMs: maxBufferMs });
-          if (running) {
-            audioNode.port.postMessage({ type: 'start' });
-            if (canWorker) {
-              startWorkerWebSocket();
-            } else {
-              flushPendingFrames();
-            }
-          }
-        }).catch(function() {
-          URL.revokeObjectURL(blobUrl);
-          workletLoading = false;
-          useWorklet = false;
-          initScriptProcessorEngine();
-          if (running && !ws) connectWsMainThread();
-        });
-        if (!canWorker) {
-          connectWsMainThread();
-        }
-      }
-    } else {
-      initScriptProcessorEngine();
-      connectWsMainThread();
-    }
-  }
-
-  function connectWsMainThread() {
-    if (!running || workerPipelineActive) return;
-    if (ws) {
-      try { ws.close(); } catch (e) {}
-      ws = null;
-    }
-
-    var proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
-    var isLoopbackHost = (location.hostname === '127.0.0.1' || location.hostname === 'localhost');
-    var ackBuf = new Uint8Array([6]);
-    var lastBinMs = 0;
-    setStatus('wait', 'Conectando ao PC...', 'Abrindo canal de baixa latência');
-    ws = new WebSocket(proto + location.host + '/ws');
-    ws.binaryType = 'arraybuffer';
-
-    ws.onopen = function() {
-      setStatus('live', 'Conectado e recebendo áudio', 'Áudio pronto — toque algo no PC para ouvir');
-      if (pingTimer) clearInterval(pingTimer);
-      pingTimer = setInterval(function(){
-        if (ws && ws.readyState === 1) {
-          ws.send(JSON.stringify({ type: 'ping', t: performance.now() }));
-        }
-      }, 2000);
-      ws.send(JSON.stringify({ type: 'ping', t: performance.now() }));
-    };
-
-    ws.onmessage = function(ev) {
-      if (typeof ev.data === 'string') {
-        try {
-          var msg = JSON.parse(ev.data);
-          if (msg.type === 'pong' && typeof msg.t === 'number') {
-            latestRttMs = Math.max(1, Math.round(performance.now() - msg.t));
-            rttStat.textContent = latestRttMs + ' ms';
-          } else if (msg.type === 'config') {
-            handleConfigFromServer(msg);
-          }
-        } catch (e) {}
-      } else if (ev.data instanceof ArrayBuffer) {
-        var now = performance.now();
-        if (lastBinMs > 0) {
-          var dt = Math.round(now - lastBinMs);
-          if (dt > latestWsGapMax) latestWsGapMax = dt;
-        }
-        lastBinMs = now;
-        dispatchAudioFrame(ev.data);
-        if (isLoopbackHost && ws && ws.readyState === 1) { try { ws.send(ackBuf); } catch (e) {} }
-      }
-    };
-
-    ws.onclose = function() {
-      if (running) {
-        disconnectSession('', 'Conexão com o PC encerrada', 'Não reconecta sozinho. Toque acima quando quiser conectar novamente');
-      }
-    };
-
-    ws.onerror = function() {
-      if (running) {
-        disconnectSession('err', 'Falha na conexão', 'Verifique se o app está aberto e o firewall liberado');
-      }
-    };
-  }
-
-  playBtn.addEventListener('click', function() {
-    if (!running) {
-      running = true;
-      pendingFrames = [];
-      latestWsGapMax = 0;
-      lastStatSendTime = 0;
-      dropStat.textContent = '0';
-      playBtn.textContent = 'Desconectar';
-      playBtn.className = 'btn-main stop';
-      startKeepAlive();
-      startSessionPipeline();
-    } else {
-      disconnectSession('', 'Desconectado', 'Toque acima para conectar novamente');
-    }
-  });
-
-  bufSlider.addEventListener('input', function() {
-    autoFollowPc = false;
-    autoModeBtn.className = 'switch-btn';
-    autoModeBtn.textContent = 'Manual';
-    updateBufferUi(parseInt(bufSlider.value, 10));
-  });
-
-  for (var i = 0; i < chips.length; i++) {
-    chips[i].addEventListener('click', function() {
-      autoFollowPc = false;
-      autoModeBtn.className = 'switch-btn';
-      autoModeBtn.textContent = 'Manual';
-      updateBufferUi(parseInt(this.getAttribute('data-ms'), 10));
-    });
-  }
-
-  volSlider.addEventListener('input', function() {
-    var v = parseInt(volSlider.value, 10);
-    volLbl.textContent = v + '%';
-    if (gainNode) gainNode.gain.value = v / 100;
-  });
-
-  autoModeBtn.addEventListener('click', function() {
-    autoFollowPc = !autoFollowPc;
-    autoModeBtn.className = autoFollowPc ? 'switch-btn on' : 'switch-btn';
-    autoModeBtn.textContent = autoFollowPc ? 'Ativo' : 'Manual';
-  });
-
-  wakeBtn.addEventListener('click', async function() {
-    if (!('wakeLock' in navigator)) {
-      wakeBtn.textContent = 'Indisponível';
-      return;
-    }
-    if (wakeLock) {
-      try { await wakeLock.release(); } catch (e) {}
-      wakeLock = null;
-      wakeBtn.className = 'switch-btn';
-      wakeBtn.textContent = 'Desativado';
-    } else {
-      try {
-        wakeLock = await navigator.wakeLock.request('screen');
-        wakeBtn.className = 'switch-btn on';
-        wakeBtn.textContent = 'Ativo';
-        wakeLock.addEventListener('release', function(){
-          wakeLock = null;
-          wakeBtn.className = 'switch-btn';
-          wakeBtn.textContent = 'Desativado';
-        });
-      } catch (e) {
-        wakeBtn.textContent = 'Bloqueado';
-      }
-    }
-  });
-})();
-</script>
-</body>
-</html>";
-        }
-    }
-
-    #endregion
-
-    #region HTTP & WebSocket Server (RFC 6455)
-
-    internal sealed class WsClientSession : IDisposable
-    {
-        private readonly TcpClient _tcp;
-        private readonly NetworkStream _stream;
-        private readonly Queue<byte[]> _sendQueue = new Queue<byte[]>();
-        private readonly AutoResetEvent _signal = new AutoResetEvent(false);
-        private readonly object _queueLock = new object();
-        private readonly Action<WsClientSession> _onDisconnect;
-        private volatile bool _closed;
-        private int _maxQueueSize = 24;
-
-        public readonly string LocalIp;
-        public readonly bool IsUsbTransport;
-        public volatile string LatestStatsJson = "";
-        public int LatestStatsTick;
-
-        public WsClientSession(TcpClient tcp, NetworkStream stream, string localIp, bool isUsbTransport, int maxQueueSize, Action<WsClientSession> onDisconnect)
-        {
-            _tcp = tcp;
-            _stream = stream;
-            LocalIp = localIp ?? "";
-            IsUsbTransport = isUsbTransport;
-            _maxQueueSize = maxQueueSize;
-            _onDisconnect = onDisconnect;
-        }
-
-        public void SetMaxQueueSize(int maxQueueSize)
-        {
-            _maxQueueSize = maxQueueSize < 4 ? 4 : maxQueueSize;
-        }
-
-        public void StartLoops()
-        {
-            var writer = new Thread(WriterLoop);
-            writer.IsBackground = true;
-            writer.Priority = ThreadPriority.Highest;
-            writer.Name = "WS-Writer";
-            writer.Start();
-
-            var reader = new Thread(ReaderLoop);
-            reader.IsBackground = true;
-            reader.Name = "WS-Reader";
-            reader.Start();
-        }
-
-        public void EnqueueText(string json)
-        {
-            byte[] payload = Encoding.UTF8.GetBytes(json);
-            byte[] frame = BuildFrame(0x81, payload);
             lock (_queueLock)
             {
                 if (_closed) return;
@@ -3200,64 +1725,23 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
             _signal.Set();
         }
 
-        public void EnqueuePrebuiltAudioFrame(byte[] wsFrame)
+        private static byte[] BuildConfigFrame(int sampleRate, int targetMs, int gainPct)
         {
-            lock (_queueLock)
-            {
-                if (_closed) return;
-                while (_sendQueue.Count >= _maxQueueSize)
-                {
-                    _sendQueue.Dequeue();
-                }
-                _sendQueue.Enqueue(wsFrame);
-            }
-            _signal.Set();
+            byte[] frame = new byte[11];
+            frame[0] = BridgeProtocol.MsgConfig;
+            BridgeProtocol.WriteU16(frame, 1, 8);
+            BridgeProtocol.WriteU32(frame, 3, (uint)sampleRate);
+            BridgeProtocol.WriteU16(frame, 7, (ushort)Math.Max(1, Math.Min(120, targetMs)));
+            BridgeProtocol.WriteU16(frame, 9, (ushort)Math.Max(0, Math.Min(150, gainPct)));
+            return frame;
         }
 
-        private void EnqueueControl(byte firstByte, byte[] payload)
+        private static byte[] BuildPingFrame(long ticks)
         {
-            byte[] frame = BuildFrame(firstByte, payload ?? new byte[0]);
-            lock (_queueLock)
-            {
-                if (_closed) return;
-                _sendQueue.Enqueue(frame);
-            }
-            _signal.Set();
-        }
-
-        private static byte[] BuildFrame(byte firstByte, byte[] payload)
-        {
-            int len = payload.Length;
-            int hdrLen;
-            if (len <= 125) hdrLen = 2;
-            else if (len <= 65535) hdrLen = 4;
-            else hdrLen = 10;
-
-            byte[] frame = new byte[hdrLen + len];
-            frame[0] = firstByte;
-            if (len <= 125)
-            {
-                frame[1] = (byte)len;
-            }
-            else if (len <= 65535)
-            {
-                frame[1] = 126;
-                frame[2] = (byte)((len >> 8) & 0xFF);
-                frame[3] = (byte)(len & 0xFF);
-            }
-            else
-            {
-                frame[1] = 127;
-                long l64 = len;
-                for (int i = 0; i < 8; i++)
-                {
-                    frame[2 + i] = (byte)((l64 >> ((7 - i) * 8)) & 0xFF);
-                }
-            }
-            if (len > 0)
-            {
-                Buffer.BlockCopy(payload, 0, frame, hdrLen, len);
-            }
+            byte[] frame = new byte[11];
+            frame[0] = BridgeProtocol.MsgPing;
+            BridgeProtocol.WriteU16(frame, 1, 8);
+            BridgeProtocol.WriteI64(frame, 3, ticks);
             return frame;
         }
 
@@ -3295,6 +1779,7 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
             }
             catch
             {
+                CloseInternal(3, "Canal USB interrompido.", true);
             }
             finally
             {
@@ -3302,773 +1787,600 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
                 {
                     try { NativeWin32.AvRevertMmThreadCharacteristics(mmcssHandle); } catch { }
                 }
-                Dispose();
             }
         }
 
         private void ReaderLoop()
         {
-            byte[] hdr2 = new byte[2];
-            byte[] extLenBuf = new byte[8];
-            byte[] maskBuf = new byte[4];
-            byte[] smallBinBuf = new byte[16];
+            byte[] hdr = new byte[3];
+            byte[] scratch = new byte[256];
             try
             {
                 while (!_closed)
                 {
-                    if (!ReadExactInto(_stream, hdr2, 2)) break;
+                    if (!ReadExactInto(_stream, hdr, 3)) break;
+                    byte msgType = hdr[0];
+                    ushort msgLen = BridgeProtocol.ReadU16(hdr, 1);
+                    if (msgLen > 65530) break;
 
-                    int opcode = hdr2[0] & 0x0F;
-                    bool masked = (hdr2[1] & 0x80) != 0;
-                    long len = hdr2[1] & 0x7F;
+                    byte[] buf = msgLen <= scratch.Length ? scratch : new byte[msgLen];
+                    if (msgLen > 0 && !ReadExactInto(_stream, buf, msgLen)) break;
 
-                    if (len == 126)
+                    int reason;
+                    if (HandleInboundMessage(msgType, buf, msgLen, out reason))
                     {
-                        if (!ReadExactInto(_stream, extLenBuf, 2)) break;
-                        len = (extLenBuf[0] << 8) | extLenBuf[1];
-                    }
-                    else if (len == 127)
-                    {
-                        if (!ReadExactInto(_stream, extLenBuf, 8)) break;
-                        len = 0;
-                        for (int i = 0; i < 8; i++) len = (len << 8) | extLenBuf[i];
-                    }
-
-                    if (masked)
-                    {
-                        if (!ReadExactInto(_stream, maskBuf, 4)) break;
-                    }
-
-                    if (len > 1048576 || len < 0) break;
-
-                    if (opcode == 0x2 && len <= smallBinBuf.Length)
-                    {
-                        if (len > 0 && !ReadExactInto(_stream, smallBinBuf, (int)len)) break;
-                        continue;
-                    }
-
-                    byte[] payload = len > 0 ? new byte[(int)len] : new byte[0];
-                    if (len > 0 && !ReadExactInto(_stream, payload, (int)len)) break;
-
-                    if (masked)
-                    {
-                        for (int i = 0; i < payload.Length; i++)
-                        {
-                            payload[i] ^= maskBuf[i & 3];
-                        }
-                    }
-
-                    if (opcode == 0x8)
-                    {
-                        EnqueueControl(0x88, new byte[0]);
-                        break;
-                    }
-                    if (opcode == 0x9)
-                    {
-                        EnqueueControl(0x8A, payload);
-                    }
-                    else if (opcode == 0x1)
-                    {
-                        string msg = Encoding.UTF8.GetString(payload);
-                        if (msg.Contains("\"ping\""))
-                        {
-                            string pong = msg.Replace("\"ping\"", "\"pong\"");
-                            EnqueueText(pong);
-                        }
-                        else if (msg.Contains("\"stats\""))
-                        {
-                            LatestStatsJson = msg;
-                            LatestStatsTick = Environment.TickCount;
-                        }
+                        string msg = reason == 1
+                            ? "Desconectado (Bluetooth/fone removido no celular — não reconecta sozinho)."
+                            : (reason == 2 ? "Desconectado pelo celular." : "Conexão encerrada pelo celular.");
+                        CloseInternal(reason, msg, true);
+                        return;
                     }
                 }
+                CloseInternal(3, "Conexão USB com o celular encerrada.", true);
             }
             catch
             {
-            }
-            finally
-            {
-                Dispose();
+                CloseInternal(3, "Conexão USB perdida.", true);
             }
         }
 
-        private static bool ReadExactInto(Stream s, byte[] buf, int count)
+        private void HandleInboundMessage(byte msgType, byte[] payload)
+        {
+            int unused;
+            HandleInboundMessage(msgType, payload, payload.Length, out unused);
+        }
+
+        private bool HandleInboundMessage(byte msgType, byte[] buf, int len, out int stopReason)
+        {
+            stopReason = 0;
+            if (msgType == BridgeProtocol.MsgPong && len >= 8)
+            {
+                long sentTicks = BridgeProtocol.ReadI64(buf, 0);
+                double rtt = ((_pingWatch.ElapsedTicks - sentTicks) * 1000.0) / Stopwatch.Frequency;
+                LatestRttMs = Math.Max(1, (int)Math.Round(rtt));
+            }
+            else if (msgType == BridgeProtocol.MsgStats && len >= 32)
+            {
+                var st = new ReceiverStats
+                {
+                    SeqLast = BridgeProtocol.ReadU32(buf, 0),
+                    BufMs = BridgeProtocol.ReadU16(buf, 4) / 10.0,
+                    MinBufMs = BridgeProtocol.ReadU16(buf, 6) / 10.0,
+                    PktGapMaxMs = BridgeProtocol.ReadU16(buf, 8),
+                    AAudioBurstFrames = BridgeProtocol.ReadU16(buf, 10),
+                    AAudioBufFrames = BridgeProtocol.ReadU16(buf, 12),
+                    AAudioFlags = BridgeProtocol.ReadU16(buf, 14),
+                    PlcTotal = BridgeProtocol.ReadU32(buf, 16),
+                    XRunTotal = BridgeProtocol.ReadU32(buf, 20),
+                    ResyncTotal = BridgeProtocol.ReadU32(buf, 24),
+                    AAudioSampleRate = BridgeProtocol.ReadU32(buf, 28),
+                    RttMs = LatestRttMs
+                };
+                lock (_statsLock)
+                {
+                    _latestStats = st;
+                }
+                if (OnStatsReceived != null)
+                {
+                    OnStatsReceived(st);
+                }
+            }
+            else if (msgType == BridgeProtocol.MsgDisconnectedByPhone)
+            {
+                stopReason = len >= 1 ? buf[0] : 1;
+                return true;
+            }
+            return false;
+        }
+
+        private static bool ReadExactInto(Stream s, byte[] dst, int count)
         {
             int read = 0;
             while (read < count)
             {
-                int n = s.Read(buf, read, count - read);
+                int n = s.Read(dst, read, count - read);
                 if (n <= 0) return false;
                 read += n;
             }
             return true;
         }
 
-        public void Dispose()
+        private void CloseInternal(int reason, string message, bool notify)
         {
             if (_closed) return;
             _closed = true;
+            _connected = false;
             try { _signal.Set(); } catch { }
-            try { _stream.Close(); } catch { }
-            try { _tcp.Close(); } catch { }
-            if (_onDisconnect != null)
+            try { if (_stream != null) _stream.Close(); } catch { }
+            try { if (_tcp != null) _tcp.Close(); } catch { }
+
+            if (notify && OnDisconnected != null)
             {
-                _onDisconnect(this);
-            }
-        }
-    }
-
-    internal sealed class AudioWebServer : IDisposable
-    {
-        private readonly int _port;
-        private readonly List<WsClientSession> _clients = new List<WsClientSession>();
-        private readonly object _clientsLock = new object();
-        private readonly HashSet<string> _usbLocalIps = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        private readonly object _usbIpLock = new object();
-        private readonly byte[] _htmlBytes;
-        private TcpListener _listener;
-        private Thread _acceptThread;
-        private volatile bool _running;
-        private uint _seqCounter;
-
-        public volatile string Mode = "wifi";
-        public volatile int SampleRate = 48000;
-        public volatile int ChunkMs = 20;
-        public volatile int TargetBufferMs = 60;
-        public volatile int MaxBufferMs = 160;
-        public volatile string DeviceName = "Padrão do Windows";
-        public volatile bool UsbDetected;
-        public volatile bool AdbActive;
-        public volatile string LastError = "";
-
-        public int ListeningPort
-        {
-            get
-            {
-                if (_listener != null && _listener.LocalEndpoint is IPEndPoint)
-                {
-                    return ((IPEndPoint)_listener.LocalEndpoint).Port;
-                }
-                return _port;
-            }
-        }
-
-        public int ClientCount
-        {
-            get
-            {
-                lock (_clientsLock)
-                {
-                    return _clients.Count;
-                }
-            }
-        }
-
-        public string ConnectedTransportSummary
-        {
-            get
-            {
-                bool hasUsb = false;
-                bool hasWifi = false;
-                lock (_clientsLock)
-                {
-                    for (int i = 0; i < _clients.Count; i++)
-                    {
-                        if (_clients[i].IsUsbTransport) hasUsb = true;
-                        else hasWifi = true;
-                    }
-                }
-                if (hasUsb && hasWifi) return "both";
-                if (hasUsb) return "usb";
-                if (hasWifi) return "wifi";
-                return "";
-            }
-        }
-
-        public AudioWebServer(int port)
-        {
-            _port = port;
-            _htmlBytes = Encoding.UTF8.GetBytes(MobilePlayerHtml.BuildPage());
-        }
-
-        public void UpdateUsbIps(HashSet<string> ips)
-        {
-            lock (_usbIpLock)
-            {
-                _usbLocalIps.Clear();
-                if (ips != null)
-                {
-                    foreach (string ip in ips)
-                    {
-                        if (!string.IsNullOrEmpty(ip))
-                        {
-                            _usbLocalIps.Add(ip);
-                        }
-                    }
-                }
-            }
-        }
-
-        private bool IsUsbLocalEndpoint(string localIp)
-        {
-            if (string.IsNullOrEmpty(localIp)) return false;
-            if (string.Equals(localIp, "127.0.0.1", StringComparison.Ordinal)) return true;
-            lock (_usbIpLock)
-            {
-                return _usbLocalIps.Contains(localIp);
-            }
-        }
-
-        private static void GetClientTransportProfile(bool isUsbTransport, out string transport, out int targetMs, out int maxMs, out int qLimit)
-        {
-            if (isUsbTransport)
-            {
-                transport = "usb";
-                targetMs = 15;
-                maxMs = 55;
-                qLimit = 24;
-            }
-            else
-            {
-                transport = "wifi";
-                targetMs = 60;
-                maxMs = 160;
-                qLimit = 24;
-            }
-        }
-
-        public void Start()
-        {
-            if (_running) return;
-            _listener = new TcpListener(IPAddress.Any, _port);
-            _listener.Start();
-            _running = true;
-            _acceptThread = new Thread(AcceptLoop);
-            _acceptThread.IsBackground = true;
-            _acceptThread.Name = "AudioBridge-HTTP-WS";
-            _acceptThread.Start();
-        }
-
-        public void UpdateProfile(BridgeMode mode, int sampleRate, string deviceName)
-        {
-            bool isUsb = (mode == BridgeMode.Usb);
-            Mode = isUsb ? "usb" : "wifi";
-            SampleRate = sampleRate > 0 ? sampleRate : 48000;
-            ChunkMs = isUsb ? 10 : 20;
-            TargetBufferMs = isUsb ? 15 : 60;
-            MaxBufferMs = isUsb ? 55 : 160;
-            DeviceName = string.IsNullOrEmpty(deviceName) ? "Padrão do Windows" : deviceName;
-
-            lock (_clientsLock)
-            {
-                for (int i = 0; i < _clients.Count; i++)
-                {
-                    string tr;
-                    int tMs;
-                    int mMs;
-                    int qLim;
-                    GetClientTransportProfile(_clients[i].IsUsbTransport, out tr, out tMs, out mMs, out qLim);
-                    _clients[i].SetMaxQueueSize(qLim);
-                    _clients[i].EnqueueText(BuildConfigJson(_clients[i].IsUsbTransport));
-                }
-            }
-        }
-
-        public void BroadcastPcm(byte[] pcm16Stereo)
-        {
-            lock (_clientsLock)
-            {
-                if (_clients.Count == 0) return;
-
-                uint seq = ++_seqCounter;
-                uint tick = unchecked((uint)Environment.TickCount);
-                int payloadLen = 8 + pcm16Stereo.Length;
-                int wsHdrLen = payloadLen <= 125 ? 2 : (payloadLen <= 65535 ? 4 : 10);
-                byte[] wsFrame = new byte[wsHdrLen + payloadLen];
-                wsFrame[0] = 0x82;
-                if (payloadLen <= 125)
-                {
-                    wsFrame[1] = (byte)payloadLen;
-                }
-                else if (payloadLen <= 65535)
-                {
-                    wsFrame[1] = 126;
-                    wsFrame[2] = (byte)((payloadLen >> 8) & 0xFF);
-                    wsFrame[3] = (byte)(payloadLen & 0xFF);
-                }
-                else
-                {
-                    wsFrame[1] = 127;
-                    long l64 = payloadLen;
-                    for (int k = 0; k < 8; k++)
-                    {
-                        wsFrame[2 + k] = (byte)((l64 >> ((7 - k) * 8)) & 0xFF);
-                    }
-                }
-
-                wsFrame[wsHdrLen] = (byte)(seq & 0xFF);
-                wsFrame[wsHdrLen + 1] = (byte)((seq >> 8) & 0xFF);
-                wsFrame[wsHdrLen + 2] = (byte)((seq >> 16) & 0xFF);
-                wsFrame[wsHdrLen + 3] = (byte)((seq >> 24) & 0xFF);
-                wsFrame[wsHdrLen + 4] = (byte)(tick & 0xFF);
-                wsFrame[wsHdrLen + 5] = (byte)((tick >> 8) & 0xFF);
-                wsFrame[wsHdrLen + 6] = (byte)((tick >> 16) & 0xFF);
-                wsFrame[wsHdrLen + 7] = (byte)((tick >> 24) & 0xFF);
-                Buffer.BlockCopy(pcm16Stereo, 0, wsFrame, wsHdrLen + 8, pcm16Stereo.Length);
-
-                for (int i = 0; i < _clients.Count; i++)
-                {
-                    _clients[i].EnqueuePrebuiltAudioFrame(wsFrame);
-                }
-            }
-        }
-
-        private string BuildConfigJson(bool isUsbTransport)
-        {
-            string tr;
-            int targetMs;
-            int maxMs;
-            int qLim;
-            GetClientTransportProfile(isUsbTransport, out tr, out targetMs, out maxMs, out qLim);
-            return string.Format(
-                "{{\"type\":\"config\",\"sampleRate\":{0},\"channels\":2,\"bits\":16,\"mode\":\"{1}\",\"transport\":\"{2}\",\"chunkMs\":{3},\"targetBufferMs\":{4},\"maxBufferMs\":{5},\"device\":\"{6}\"}}",
-                SampleRate,
-                Mode,
-                tr,
-                ChunkMs,
-                targetMs,
-                maxMs,
-                EscapeJson(DeviceName));
-        }
-
-        public string GetLiveClientStatsSummary(out bool hasGlitches)
-        {
-            hasGlitches = false;
-            string latestJson = "";
-            int clientTotal = 0;
-            lock (_clientsLock)
-            {
-                clientTotal = _clients.Count;
-                for (int i = 0; i < _clients.Count; i++)
-                {
-                    if (!string.IsNullOrEmpty(_clients[i].LatestStatsJson))
-                    {
-                        latestJson = _clients[i].LatestStatsJson;
-                        break;
-                    }
-                }
-            }
-
-            if (clientTotal == 0)
-            {
-                return "Telemetria ao vivo: aguardando conexão do celular...";
-            }
-            if (string.IsNullOrEmpty(latestJson))
-            {
-                return "Telemetria ao vivo: conectado (aguardando métricas do player...)";
-            }
-
-            string engine = ExtractJsonStr(latestJson, "engine");
-            int bufMs = ExtractJsonInt(latestJson, "bufMs");
-            int minBufMs = ExtractJsonInt(latestJson, "minBufMs");
-            int gapMs = ExtractJsonInt(latestJson, "wsGapMaxMs");
-            int plcPerSec = ExtractJsonInt(latestJson, "plcPerSec");
-            int resyncs = ExtractJsonInt(latestJson, "resyncs");
-            int rttMs = ExtractJsonInt(latestJson, "rttMs");
-            if (plcPerSec > 0) hasGlitches = true;
-
-            return string.Format(
-                "{0} | Buf {1}ms (mín {2}ms) | Gap {3}ms | Cortes/s: {4} | Resync: {5} | Ping {6}ms",
-                string.IsNullOrEmpty(engine) ? "Player" : engine,
-                bufMs,
-                minBufMs,
-                gapMs,
-                plcPerSec,
-                resyncs,
-                rttMs);
-        }
-
-        private static string ExtractJsonStr(string json, string key)
-        {
-            string pat = "\"" + key + "\":\"";
-            int idx = json.IndexOf(pat, StringComparison.Ordinal);
-            if (idx < 0) return "";
-            int start = idx + pat.Length;
-            int end = json.IndexOf('"', start);
-            if (end <= start) return "";
-            return json.Substring(start, end - start);
-        }
-
-        private static int ExtractJsonInt(string json, string key)
-        {
-            string pat = "\"" + key + "\":";
-            int idx = json.IndexOf(pat, StringComparison.Ordinal);
-            if (idx < 0) return 0;
-            int i = idx + pat.Length;
-            while (i < json.Length && json[i] == ' ') i++;
-            int start = i;
-            if (i < json.Length && json[i] == '-') i++;
-            while (i < json.Length && char.IsDigit(json[i])) i++;
-            if (i <= start) return 0;
-            int val;
-            if (int.TryParse(json.Substring(start, i - start), out val)) return val;
-            return 0;
-        }
-
-        private string BuildInfoJson()
-        {
-            var usbListSb = new StringBuilder();
-            lock (_usbIpLock)
-            {
-                bool first = true;
-                foreach (string ip in _usbLocalIps)
-                {
-                    if (!first) usbListSb.Append(",");
-                    usbListSb.Append("\"").Append(EscapeJson(ip)).Append("\"");
-                    first = false;
-                }
-            }
-
-            var statsSb = new StringBuilder();
-            lock (_clientsLock)
-            {
-                bool first = true;
-                for (int i = 0; i < _clients.Count; i++)
-                {
-                    string s = (_clients[i].LatestStatsJson ?? "").Trim();
-                    if (s.StartsWith("{", StringComparison.Ordinal) && s.EndsWith("}", StringComparison.Ordinal))
-                    {
-                        if (!first) statsSb.Append(",");
-                        statsSb.Append(s);
-                        first = false;
-                    }
-                }
-            }
-
-            return string.Format(
-                "{{\"mode\":\"{0}\",\"sampleRate\":{1},\"channels\":2,\"bits\":16,\"chunkMs\":{2},\"targetBufferMs\":{3},\"maxBufferMs\":{4},\"device\":\"{5}\",\"clients\":{6},\"clientTransports\":\"{7}\",\"usbDetected\":{8},\"adbActive\":{9},\"usbIps\":[{10}],\"clientStats\":[{11}]}}",
-                Mode,
-                SampleRate,
-                ChunkMs,
-                TargetBufferMs,
-                MaxBufferMs,
-                EscapeJson(DeviceName),
-                ClientCount,
-                ConnectedTransportSummary,
-                UsbDetected ? "true" : "false",
-                AdbActive ? "true" : "false",
-                usbListSb.ToString(),
-                statsSb.ToString());
-        }
-
-        private static string EscapeJson(string s)
-        {
-            if (string.IsNullOrEmpty(s)) return "";
-            return s.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\r", " ").Replace("\n", " ");
-        }
-
-        private void AcceptLoop()
-        {
-            while (_running)
-            {
-                try
-                {
-                    TcpClient client = _listener.AcceptTcpClient();
-                    ThreadPool.QueueUserWorkItem(delegate(object state)
-                    {
-                        HandleClient((TcpClient)state);
-                    }, client);
-                }
-                catch (SocketException)
-                {
-                    if (!_running) break;
-                }
-                catch (Exception ex)
-                {
-                    LastError = ex.Message;
-                }
-            }
-        }
-
-        private void HandleClient(TcpClient client)
-        {
-            bool keepOpen = false;
-            try
-            {
-                client.NoDelay = true;
-                client.SendBufferSize = 65536;
-                client.ReceiveTimeout = 5000;
-                client.SendTimeout = 5000;
-                NetworkStream stream = client.GetStream();
-
-                string headerText = ReadHttpHeaders(stream);
-                if (string.IsNullOrEmpty(headerText))
-                {
-                    return;
-                }
-
-                string[] lines = headerText.Split(new string[] { "\r\n" }, StringSplitOptions.None);
-                if (lines.Length == 0) return;
-
-                string[] reqLine = lines[0].Split(' ');
-                if (reqLine.Length < 2) return;
-                string rawPath = reqLine[1];
-                int qIdx = rawPath.IndexOf('?');
-                string path = qIdx >= 0 ? rawPath.Substring(0, qIdx) : rawPath;
-
-                var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-                for (int i = 1; i < lines.Length; i++)
-                {
-                    int colon = lines[i].IndexOf(':');
-                    if (colon > 0)
-                    {
-                        string k = lines[i].Substring(0, colon).Trim();
-                        string v = lines[i].Substring(colon + 1).Trim();
-                        headers[k] = v;
-                    }
-                }
-
-                if (string.Equals(path, "/ws", StringComparison.OrdinalIgnoreCase) &&
-                    headers.ContainsKey("Sec-WebSocket-Key"))
-                {
-                    string wsKey = headers["Sec-WebSocket-Key"];
-                    string accept = ComputeWebSocketAccept(wsKey);
-                    string upgradeResp =
-                        "HTTP/1.1 101 Switching Protocols\r\n" +
-                        "Upgrade: websocket\r\n" +
-                        "Connection: Upgrade\r\n" +
-                        "Sec-WebSocket-Accept: " + accept + "\r\n\r\n";
-                    byte[] respBytes = Encoding.ASCII.GetBytes(upgradeResp);
-                    stream.Write(respBytes, 0, respBytes.Length);
-                    stream.Flush();
-
-                    client.ReceiveTimeout = 0;
-                    client.SendTimeout = 3000;
-
-                    string localIp = "";
-                    IPEndPoint lep = client.Client.LocalEndPoint as IPEndPoint;
-                    if (lep != null) localIp = lep.Address.ToString();
-                    bool isUsbClient = IsUsbLocalEndpoint(localIp);
-
-                    string tr;
-                    int tMs;
-                    int mMs;
-                    int qLimit;
-                    GetClientTransportProfile(isUsbClient, out tr, out tMs, out mMs, out qLimit);
-
-                    var session = new WsClientSession(client, stream, localIp, isUsbClient, qLimit, OnSessionClosed);
-                    lock (_clientsLock)
-                    {
-                        _clients.Add(session);
-                    }
-                    session.StartLoops();
-                    session.EnqueueText(BuildConfigJson(isUsbClient));
-                    keepOpen = true;
-                    return;
-                }
-
-                if (string.Equals(path, "/api/info", StringComparison.OrdinalIgnoreCase))
-                {
-                    WriteHttpResponse(stream, "200 OK", "application/json; charset=utf-8", Encoding.UTF8.GetBytes(BuildInfoJson()));
-                    return;
-                }
-
-                if (string.Equals(path, "/favicon.ico", StringComparison.OrdinalIgnoreCase))
-                {
-                    byte[] emptyResp = Encoding.ASCII.GetBytes("HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n");
-                    stream.Write(emptyResp, 0, emptyResp.Length);
-                    return;
-                }
-
-                WriteHttpResponse(stream, "200 OK", "text/html; charset=utf-8", _htmlBytes);
-            }
-            catch
-            {
-            }
-            finally
-            {
-                if (!keepOpen)
-                {
-                    try { client.Close(); } catch { }
-                }
-            }
-        }
-
-        private void OnSessionClosed(WsClientSession session)
-        {
-            lock (_clientsLock)
-            {
-                _clients.Remove(session);
-            }
-        }
-
-        private static string ReadHttpHeaders(NetworkStream stream)
-        {
-            byte[] buf = new byte[8192];
-            int total = 0;
-            while (total < buf.Length)
-            {
-                int b = stream.ReadByte();
-                if (b < 0) break;
-                buf[total++] = (byte)b;
-                if (total >= 4 &&
-                    buf[total - 4] == 13 &&
-                    buf[total - 3] == 10 &&
-                    buf[total - 2] == 13 &&
-                    buf[total - 1] == 10)
-                {
-                    return Encoding.ASCII.GetString(buf, 0, total);
-                }
-            }
-            return "";
-        }
-
-        private static void WriteHttpResponse(NetworkStream stream, string status, string contentType, byte[] body)
-        {
-            string hdr = string.Format(
-                "HTTP/1.1 {0}\r\nContent-Type: {1}\r\nContent-Length: {2}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
-                status,
-                contentType,
-                body.Length);
-            byte[] hdrBytes = Encoding.ASCII.GetBytes(hdr);
-            stream.Write(hdrBytes, 0, hdrBytes.Length);
-            if (body.Length > 0)
-            {
-                stream.Write(body, 0, body.Length);
-            }
-            stream.Flush();
-        }
-
-        private static string ComputeWebSocketAccept(string key)
-        {
-            string concat = key.Trim() + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-            using (SHA1 sha1 = SHA1.Create())
-            {
-                byte[] hash = sha1.ComputeHash(Encoding.UTF8.GetBytes(concat));
-                return Convert.ToBase64String(hash);
+                OnDisconnected(reason, message);
             }
         }
 
         public void Dispose()
         {
-            _running = false;
-            try { if (_listener != null) _listener.Stop(); } catch { }
-            lock (_clientsLock)
-            {
-                var copy = new List<WsClientSession>(_clients);
-                _clients.Clear();
-                for (int i = 0; i < copy.Count; i++)
-                {
-                    copy[i].Dispose();
-                }
-            }
+            SendStopAndClose();
+            try { _signal.Close(); } catch { }
         }
     }
 
     #endregion
 
-    #region Windows Desktop UI & System Tray
+    #region Adaptive Latency Controller (1-120 ms Auto-Downshift & Stabilize)
+
+    internal sealed class AdaptiveLatencyController
+    {
+        private struct GlitchSample
+        {
+            public long TimeMs;
+            public uint Count;
+        }
+
+        private readonly Queue<GlitchSample> _recentGlitches = new Queue<GlitchSample>();
+
+        public int TargetMs { get; private set; }
+        public bool AutoOptimize { get; private set; }
+        public AdaptiveState State { get; private set; }
+        public int KnownUnsafeFloorMs { get; private set; }
+
+        private int _declinedStabilizeAtMs = -1;
+        private uint _prevTotalGlitches;
+        private bool _hasPrevSample;
+        private long _warmupUntilMs;
+        private long _stateStartMs;
+        private long _zeroStartMs;
+        private long _lastStepMs;
+
+        public Action<int, string> OnTargetMsChanged;
+        public Action<int, double> OnStabilizePromptRequested;
+
+        public AdaptiveLatencyController(int initialTargetMs)
+        {
+            TargetMs = ClampMs(initialTargetMs);
+            AutoOptimize = true;
+            State = AdaptiveState.Warmup;
+        }
+
+        public void Reset(int initialTargetMs, long nowMs)
+        {
+            TargetMs = ClampMs(initialTargetMs);
+            KnownUnsafeFloorMs = 0;
+            _declinedStabilizeAtMs = -1;
+            _prevTotalGlitches = 0;
+            _hasPrevSample = false;
+            _recentGlitches.Clear();
+            _stateStartMs = nowMs;
+            _zeroStartMs = nowMs;
+            _lastStepMs = nowMs;
+            _warmupUntilMs = nowMs + 1500;
+            State = AutoOptimize ? AdaptiveState.Warmup : AdaptiveState.Manual;
+        }
+
+        public void SetAutoOptimize(bool enabled, long nowMs)
+        {
+            AutoOptimize = enabled;
+            _recentGlitches.Clear();
+            _zeroStartMs = nowMs;
+            _stateStartMs = nowMs;
+            if (!enabled)
+            {
+                State = AdaptiveState.Manual;
+            }
+            else if (State == AdaptiveState.Manual)
+            {
+                _warmupUntilMs = nowMs + 1500;
+                State = AdaptiveState.Warmup;
+            }
+        }
+
+        public void OnManualTargetChanged(int ms, long nowMs)
+        {
+            TargetMs = ClampMs(ms);
+            KnownUnsafeFloorMs = 0;
+            _declinedStabilizeAtMs = -1;
+            _recentGlitches.Clear();
+            _stateStartMs = nowMs;
+            _zeroStartMs = nowMs;
+            _lastStepMs = nowMs;
+            _warmupUntilMs = nowMs + 10000;
+            State = AutoOptimize ? AdaptiveState.Warmup : AdaptiveState.Manual;
+        }
+
+        public void StartStabilizing(long nowMs)
+        {
+            if (TargetMs >= 120)
+            {
+                State = AdaptiveState.FloorLocked;
+                return;
+            }
+            _declinedStabilizeAtMs = -1;
+            KnownUnsafeFloorMs = Math.Max(KnownUnsafeFloorMs, TargetMs);
+            int step = TargetMs < 20 ? 2 : 5;
+            TargetMs = ClampMs(TargetMs + step);
+            State = AdaptiveState.Stabilizing;
+            _stateStartMs = nowMs;
+            _lastStepMs = nowMs;
+            _zeroStartMs = nowMs;
+            _recentGlitches.Clear();
+            if (OnTargetMsChanged != null)
+            {
+                OnTargetMsChanged(TargetMs, "Estabilizando");
+            }
+        }
+
+        public void DeclineStabilize(long nowMs)
+        {
+            _declinedStabilizeAtMs = TargetMs;
+            _recentGlitches.Clear();
+            _zeroStartMs = nowMs;
+            _stateStartMs = nowMs;
+            State = AutoOptimize ? AdaptiveState.Monitoring : AdaptiveState.Manual;
+        }
+
+        public void ProcessStats(uint totalGlitches, long nowMs)
+        {
+            uint delta = 0;
+            if (_hasPrevSample && totalGlitches >= _prevTotalGlitches)
+            {
+                delta = totalGlitches - _prevTotalGlitches;
+            }
+            _prevTotalGlitches = totalGlitches;
+            _hasPrevSample = true;
+
+            if (!AutoOptimize || State == AdaptiveState.Manual)
+            {
+                State = AdaptiveState.Manual;
+                return;
+            }
+
+            if (State == AdaptiveState.Warmup)
+            {
+                _zeroStartMs = nowMs;
+                if (nowMs >= _warmupUntilMs)
+                {
+                    State = AdaptiveState.Monitoring;
+                    _stateStartMs = nowMs;
+                    _zeroStartMs = nowMs;
+                    _recentGlitches.Clear();
+                }
+                return;
+            }
+
+            if (State == AdaptiveState.PromptPending)
+            {
+                return;
+            }
+
+            if (delta > 0)
+            {
+                _recentGlitches.Enqueue(new GlitchSample { TimeMs = nowMs, Count = delta });
+                _zeroStartMs = nowMs;
+            }
+            while (_recentGlitches.Count > 0 && (nowMs - _recentGlitches.Peek().TimeMs) > 3000)
+            {
+                _recentGlitches.Dequeue();
+            }
+
+            if (State == AdaptiveState.ProbingDown)
+            {
+                if (delta > 0)
+                {
+                    int failedMs = TargetMs;
+                    KnownUnsafeFloorMs = Math.Max(KnownUnsafeFloorMs, failedMs);
+                    TargetMs = ClampMs(failedMs + 1);
+                    State = AdaptiveState.FloorLocked;
+                    _stateStartMs = nowMs;
+                    _zeroStartMs = nowMs;
+                    _recentGlitches.Clear();
+                    if (OnTargetMsChanged != null)
+                    {
+                        OnTargetMsChanged(TargetMs, "Piso mínimo encontrado");
+                    }
+                }
+                else if ((nowMs - _stateStartMs) >= 3500)
+                {
+                    _zeroStartMs = nowMs;
+                    if (TargetMs <= 1 || (TargetMs - 1) <= KnownUnsafeFloorMs)
+                    {
+                        State = AdaptiveState.FloorLocked;
+                        _stateStartMs = nowMs;
+                    }
+                    else
+                    {
+                        State = AdaptiveState.Monitoring;
+                        _stateStartMs = nowMs;
+                    }
+                }
+                return;
+            }
+
+            if (State == AdaptiveState.Stabilizing)
+            {
+                if (delta > 0)
+                {
+                    if ((nowMs - _lastStepMs) >= 2500 && TargetMs < 120)
+                    {
+                        KnownUnsafeFloorMs = Math.Max(KnownUnsafeFloorMs, TargetMs);
+                        int step = TargetMs < 20 ? 2 : 5;
+                        TargetMs = ClampMs(TargetMs + step);
+                        _lastStepMs = nowMs;
+                        _zeroStartMs = nowMs;
+                        _recentGlitches.Clear();
+                        if (OnTargetMsChanged != null)
+                        {
+                            OnTargetMsChanged(TargetMs, "Estabilizando");
+                        }
+                    }
+                }
+                else if ((nowMs - _zeroStartMs) >= 4000)
+                {
+                    State = AdaptiveState.FloorLocked;
+                    _stateStartMs = nowMs;
+                    _recentGlitches.Clear();
+                }
+                return;
+            }
+
+            // Monitoring or FloorLocked: check sustained glitches for interactive stabilize prompt
+            uint sumRecent = 0;
+            foreach (GlitchSample s in _recentGlitches)
+            {
+                sumRecent += s.Count;
+            }
+            if (sumRecent >= 4 && TargetMs < 120 && TargetMs != _declinedStabilizeAtMs)
+            {
+                State = AdaptiveState.PromptPending;
+                _stateStartMs = nowMs;
+                if (OnStabilizePromptRequested != null)
+                {
+                    OnStabilizePromptRequested(TargetMs, sumRecent / 3.0);
+                }
+                return;
+            }
+
+            // Silent auto-downshift while Monitoring
+            if (State == AdaptiveState.Monitoring && delta == 0)
+            {
+                if (TargetMs > 1 && (TargetMs - 1) > KnownUnsafeFloorMs && (nowMs - _zeroStartMs) >= 6000)
+                {
+                    TargetMs = ClampMs(TargetMs - 1);
+                    State = AdaptiveState.ProbingDown;
+                    _stateStartMs = nowMs;
+                    _recentGlitches.Clear();
+                    if (OnTargetMsChanged != null)
+                    {
+                        OnTargetMsChanged(TargetMs, "Testando redução silenciosa");
+                    }
+                }
+            }
+        }
+
+        public string GetStatusLabelPt()
+        {
+            switch (State)
+            {
+                case AdaptiveState.Warmup: return string.Format("Aquecendo em {0} ms...", TargetMs);
+                case AdaptiveState.Monitoring: return string.Format("Estável em {0} ms (testando menor ms se liso)", TargetMs);
+                case AdaptiveState.ProbingDown: return string.Format("Testando {0} ms silenciosamente...", TargetMs);
+                case AdaptiveState.PromptPending: return string.Format("Cortes em {0} ms — aguardando resposta", TargetMs);
+                case AdaptiveState.Stabilizing: return string.Format("Estabilizando → {0} ms...", TargetMs);
+                case AdaptiveState.FloorLocked:
+                    return KnownUnsafeFloorMs > 0
+                        ? string.Format("Piso ótimo travado em {0} ms", TargetMs)
+                        : string.Format("Estabilizado em {0} ms", TargetMs);
+                default: return string.Format("Manual ({0} ms)", TargetMs);
+            }
+        }
+
+        private static int ClampMs(int ms)
+        {
+            if (ms < 1) return 1;
+            if (ms > 120) return 120;
+            return ms;
+        }
+    }
+
+    #endregion
+
+    #region Custom Dark Prompt Dialog
+
+    internal sealed class DarkPromptDialog : Form
+    {
+        public DarkPromptDialog(string title, string headline, string body, string yesText, string noText, Color accentColor)
+        {
+            Text = title;
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            ShowInTaskbar = true;
+            TopMost = true;
+            StartPosition = FormStartPosition.CenterScreen;
+            ClientSize = new Size(440, 210);
+            BackColor = Color.FromArgb(20, 24, 33);
+            ForeColor = Color.FromArgb(241, 245, 249);
+            Font = new Font("Segoe UI", 9.5f);
+
+            var lblHead = new Label
+            {
+                Text = headline,
+                Location = new Point(20, 18),
+                Size = new Size(400, 28),
+                Font = new Font("Segoe UI", 11.5f, FontStyle.Bold),
+                ForeColor = accentColor
+            };
+
+            var lblBody = new Label
+            {
+                Text = body,
+                Location = new Point(20, 52),
+                Size = new Size(400, 90),
+                Font = new Font("Segoe UI", 9.5f),
+                ForeColor = Color.FromArgb(203, 213, 225)
+            };
+
+            var btnYes = new Button
+            {
+                Text = yesText,
+                DialogResult = DialogResult.Yes,
+                Location = new Point(20, 152),
+                Size = new Size(215, 38),
+                FlatStyle = FlatStyle.Flat,
+                BackColor = Color.FromArgb(22, 163, 74),
+                ForeColor = Color.White,
+                Font = new Font("Segoe UI", 9.5f, FontStyle.Bold),
+                Cursor = Cursors.Hand
+            };
+            btnYes.FlatAppearance.BorderSize = 0;
+
+            var btnNo = new Button
+            {
+                Text = noText,
+                DialogResult = DialogResult.No,
+                Location = new Point(245, 152),
+                Size = new Size(175, 38),
+                FlatStyle = FlatStyle.Flat,
+                BackColor = Color.FromArgb(39, 48, 66),
+                ForeColor = Color.White,
+                Font = new Font("Segoe UI", 9.5f, FontStyle.Bold),
+                Cursor = Cursors.Hand
+            };
+            btnNo.FlatAppearance.BorderSize = 0;
+
+            Controls.Add(lblHead);
+            Controls.Add(lblBody);
+            Controls.Add(btnYes);
+            Controls.Add(btnNo);
+            AcceptButton = btnYes;
+            CancelButton = btnNo;
+        }
+    }
+
+    #endregion
+
+    #region Main Window & Tray Application
 
     internal sealed class MainBridgeForm : Form
     {
-        private const int DefaultPort = 8765;
+        private const int ForwardPort = 8765;
         private const string RunRegPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
         private const string AppRunName = "PhoneAudioBridge";
 
         private readonly WasapiLoopbackCapture _capture;
-        private readonly AudioWebServer _server;
-        private readonly NotifyIcon _trayIcon;
-        private readonly ContextMenuStrip _trayMenu;
-        private readonly ToolStripMenuItem _miStartup;
-        private readonly ToolStripMenuItem _miModeWifi;
-        private readonly ToolStripMenuItem _miModeUsb;
+        private readonly AdaptiveLatencyController _adaptive;
+        private readonly Stopwatch _sessionClock = Stopwatch.StartNew();
+        private readonly object _clientLock = new object();
+        private NativeUsbAudioClient _usbClient;
 
-        private BridgeMode _mode = BridgeMode.Wifi;
-        private bool _adbActive;
-        private string _adbMessage = "";
-        private string _currentUrl = "";
-        private Bitmap _currentQrBmp;
+        private readonly HashSet<string> _promptedSerials = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private string _activeSerial = "";
+        private string _activeModel = "";
+        private string _adbExe = "";
         private bool _forceExit;
-        private int _netTickDivider;
-        private bool _updatingCombos;
+        private bool _popupOpen;
+        private bool _connecting;
+        private bool _autoConnectRequested;
+        private long _lastPingMs;
+        private long _lastLiveJsonMs;
+        private int _adbPollCounter;
+        private int _pendingGainPct = 100;
+        private uint _prevGlitchForRate;
+        private long _prevGlitchRateMs;
+        private int _glitchesPerSec;
+        private string _lastDisconnectReason = "";
 
-        private Label _lblStatusBadge;
-        private Button _btnWifi;
-        private Button _btnUsb;
+        private NotifyIcon _trayIcon;
+        private ContextMenuStrip _trayMenu;
+        private ToolStripMenuItem _miStartup;
+
+        private Label _lblConnectionBadge;
+        private Label _lblPhoneState;
+        private ComboBox _cmbDevices;
         private ComboBox _cmbAudio;
-        private ComboBox _cmbNetwork;
-        private Panel _vuMeterHost;
-        private Panel _vuMeterBar;
-        private Panel _usbGuideCard;
-        private Label _lblUsbStatus;
-        private Label _lblUsbSteps;
-        private Button _btnAdbTunnel;
-        private Button _btnFirewall;
-        private Button _btnCopyUrl;
-        private PictureBox _picQr;
-        private TextBox _txtUrl;
-        private Label _lblQrHint;
+        private Button _btnConnect;
+        private Button _btnDisconnect;
+        private CheckBox _chkAutoPrompt;
+        private CheckBox _chkAutoOptimize;
+        private TrackBar _trkTargetMs;
+        private Label _lblTargetMsVal;
+        private TrackBar _trkGain;
+        private Label _lblGainVal;
+        private Panel _vuHost;
+        private Panel _vuBar;
+        private Label _lblAdaptiveStatus;
         private Label _lblLiveDiag;
         private System.Windows.Forms.Timer _uiTimer;
 
-        public MainBridgeForm(BridgeMode initialMode)
+        public MainBridgeForm(bool startMinimized, bool autoConnect)
         {
+            _autoConnectRequested = autoConnect;
+            _adbExe = AdbHelper.FindAdbExecutable();
+
             _capture = new WasapiLoopbackCapture();
-            _server = new AudioWebServer(DefaultPort);
+            _adaptive = new AdaptiveLatencyController(10);
 
             _capture.OnPcmPacket = delegate(byte[] pcm, int rate)
             {
-                _server.BroadcastPcm(pcm);
+                NativeUsbAudioClient c;
+                lock (_clientLock) { c = _usbClient; }
+                if (c != null && c.IsConnected)
+                {
+                    c.EnqueuePcm(pcm);
+                }
             };
             _capture.OnFormatChanged = delegate(int rate, string devName)
             {
-                _server.UpdateProfile(_mode, rate, devName);
+                // Kept synchronized cleanly when connecting/restarting
+            };
+
+            _adaptive.OnTargetMsChanged = delegate(int newMs, string reason)
+            {
+                try
+                {
+                    BeginInvoke((MethodInvoker)delegate
+                    {
+                        ApplyTargetMsFromAdaptive(newMs);
+                    });
+                }
+                catch { }
+            };
+            _adaptive.OnStabilizePromptRequested = delegate(int curMs, double gRate)
+            {
+                try
+                {
+                    BeginInvoke((MethodInvoker)delegate
+                    {
+                        ShowStabilizePrompt(curMs, gRate);
+                    });
+                }
+                catch { }
             };
 
             BuildUi();
-
-            _trayMenu = new ContextMenuStrip();
-            var miOpen = new ToolStripMenuItem("Abrir janela", null, delegate { ShowFromTray(); });
-            miOpen.Font = new Font("Segoe UI", 9f, FontStyle.Bold);
-            _miModeWifi = new ToolStripMenuItem("Modo Wi-Fi / Rede Local", null, delegate { SetMode(BridgeMode.Wifi); });
-            _miModeUsb = new ToolStripMenuItem("Modo Cabo USB (Menor Delay)", null, delegate { SetMode(BridgeMode.Usb); });
-            _miStartup = new ToolStripMenuItem("Iniciar com o Windows", null, delegate { ToggleStartup(); });
-            _miStartup.Checked = IsStartupEnabled();
-            var miExit = new ToolStripMenuItem("Sair", null, delegate { ExitCleanly(); });
-
-            _trayMenu.Items.Add(miOpen);
-            _trayMenu.Items.Add(new ToolStripSeparator());
-            _trayMenu.Items.Add(_miModeWifi);
-            _trayMenu.Items.Add(_miModeUsb);
-            _trayMenu.Items.Add(new ToolStripSeparator());
-            _trayMenu.Items.Add(_miStartup);
-            _trayMenu.Items.Add(miExit);
-
-            _trayIcon = new NotifyIcon();
-            _trayIcon.Text = "Phone Audio Bridge";
-            _trayIcon.Icon = CreateTrayIcon();
-            _trayIcon.ContextMenuStrip = _trayMenu;
-            _trayIcon.Visible = true;
-            _trayIcon.DoubleClick += delegate { ShowFromTray(); };
+            BuildTray();
 
             RefreshAudioDevices();
-            RefreshAdbAndNetwork(true);
-            SetMode(initialMode);
-
-            _server.Start();
+            RefreshAdbDevices(true);
             _capture.Start();
-            UpdateFirewallButtonState();
 
             _uiTimer = new System.Windows.Forms.Timer();
             _uiTimer.Interval = 120;
             _uiTimer.Tick += OnUiTick;
             _uiTimer.Start();
+
+            if (startMinimized)
+            {
+                WindowState = FormWindowState.Minimized;
+                ShowInTaskbar = false;
+            }
         }
 
         private void BuildUi()
         {
-            Text = "Phone Audio Bridge — Áudio do PC no Fone via Celular";
-            ClientSize = new Size(780, 594);
+            Text = "Phone Audio Bridge · USB Nativo (AAudio)";
+            ClientSize = new Size(560, 620);
             StartPosition = FormStartPosition.CenterScreen;
             BackColor = Color.FromArgb(18, 21, 28);
             ForeColor = Color.FromArgb(241, 245, 249);
@@ -4077,77 +2389,92 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
             MaximizeBox = false;
             Icon = CreateTrayIcon();
 
-            // Header
+            int lx = 22;
+            int lw = 516;
+
             var lblTitle = new Label
             {
-                Text = "Phone Audio Bridge",
-                Font = new Font("Segoe UI", 16f, FontStyle.Bold),
-                ForeColor = Color.White,
-                Location = new Point(22, 16),
-                AutoSize = true
+                Text = "Phone Audio Bridge (USB Nativo)",
+                Location = new Point(lx, 16),
+                Size = new Size(340, 28),
+                Font = new Font("Segoe UI", 14f, FontStyle.Bold),
+                ForeColor = Color.White
+            };
+            _lblConnectionBadge = new Label
+            {
+                Text = "Aguardando USB",
+                Location = new Point(386, 18),
+                Size = new Size(152, 26),
+                TextAlign = ContentAlignment.MiddleCenter,
+                BackColor = Color.FromArgb(30, 41, 59),
+                ForeColor = Color.FromArgb(56, 189, 248),
+                Font = new Font("Segoe UI", 8.5f, FontStyle.Bold)
             };
             var lblSub = new Label
             {
-                Text = "Conecte o fone Bluetooth no celular e escaneie o QR Code para ouvir o áudio do PC",
-                Font = new Font("Segoe UI", 9f),
-                ForeColor = Color.FromArgb(148, 163, 184),
-                Location = new Point(24, 46),
-                AutoSize = true
-            };
-            _lblStatusBadge = new Label
-            {
-                Text = "Aguardando celular...",
-                Font = new Font("Segoe UI", 9f, FontStyle.Bold),
-                BackColor = Color.FromArgb(30, 41, 59),
-                ForeColor = Color.FromArgb(56, 189, 248),
-                TextAlign = ContentAlignment.MiddleCenter,
-                Location = new Point(548, 20),
-                Size = new Size(210, 30)
+                Text = "Pluge o cabo USB com Depuração USB ativa — conexão direta C++ AAudio sem navegador.",
+                Location = new Point(lx, 48),
+                Size = new Size(lw, 20),
+                Font = new Font("Segoe UI", 8.5f),
+                ForeColor = Color.FromArgb(148, 163, 184)
             };
             Controls.Add(lblTitle);
+            Controls.Add(_lblConnectionBadge);
             Controls.Add(lblSub);
-            Controls.Add(_lblStatusBadge);
 
-            // Left panel controls
-            int lx = 22;
-            int lw = 408;
-
-            var lblMode = MakeSectionLabel("1. MODO DE CONEXÃO", lx, 78);
-            Controls.Add(lblMode);
-
-            _btnWifi = new Button
+            // Section 1: USB Phone
+            Controls.Add(MakeSectionLabel("1. CELULAR ANDROID CONECTADO VIA CABO USB (ADB)", lx, 80));
+            _cmbDevices = new ComboBox
             {
-                Text = "Wi-Fi / Rede Local\r\nSem cabos (~60 ms)",
-                Location = new Point(lx, 100),
-                Size = new Size(198, 52),
-                FlatStyle = FlatStyle.Flat,
-                Font = new Font("Segoe UI", 9.5f, FontStyle.Bold),
-                Cursor = Cursors.Hand
+                Location = new Point(lx, 102),
+                Size = new Size(422, 28),
+                DropDownStyle = ComboBoxStyle.DropDownList,
+                BackColor = Color.FromArgb(27, 32, 44),
+                ForeColor = Color.White,
+                FlatStyle = FlatStyle.Flat
             };
-            _btnWifi.FlatAppearance.BorderSize = 2;
-            _btnWifi.Click += delegate { SetMode(BridgeMode.Wifi); };
-
-            _btnUsb = new Button
+            var btnRefreshUsb = MakeButton("Atualizar", lx + 432, 101, 84, 28, Color.FromArgb(35, 43, 59));
+            btnRefreshUsb.Click += delegate { RefreshAdbDevices(true); };
+            _lblPhoneState = new Label
             {
-                Text = "Cabo USB (Menor Delay)\r\nUltra-baixo (10–15 ms)",
-                Location = new Point(lx + 210, 100),
-                Size = new Size(198, 52),
-                FlatStyle = FlatStyle.Flat,
-                Font = new Font("Segoe UI", 9.5f, FontStyle.Bold),
-                Cursor = Cursors.Hand
+                Text = "Procurando celular USB...",
+                Location = new Point(lx, 136),
+                Size = new Size(lw, 22),
+                Font = new Font("Segoe UI", 8.75f, FontStyle.Bold),
+                ForeColor = Color.FromArgb(245, 158, 11)
             };
-            _btnUsb.FlatAppearance.BorderSize = 2;
-            _btnUsb.Click += delegate { SetMode(BridgeMode.Usb); };
+            Controls.Add(_cmbDevices);
+            Controls.Add(btnRefreshUsb);
+            Controls.Add(_lblPhoneState);
 
-            Controls.Add(_btnWifi);
-            Controls.Add(_btnUsb);
+            // Connect / Disconnect Buttons
+            _btnConnect = MakeButton("Conectar e Ouvir Agora", lx, 166, 332, 40, Color.FromArgb(22, 163, 74));
+            _btnConnect.Font = new Font("Segoe UI", 10f, FontStyle.Bold);
+            _btnConnect.Click += delegate { ConnectSelectedDevice(); };
 
-            // Audio source
-            Controls.Add(MakeSectionLabel("2. FONTE DE ÁUDIO DO WINDOWS", lx, 166));
+            _btnDisconnect = MakeButton("Desconectar", lx + 344, 166, 172, 40, Color.FromArgb(65, 28, 34));
+            _btnDisconnect.Font = new Font("Segoe UI", 10f, FontStyle.Bold);
+            _btnDisconnect.Enabled = false;
+            _btnDisconnect.Click += delegate { DisconnectManual("Desconectado pelo PC."); };
+            Controls.Add(_btnConnect);
+            Controls.Add(_btnDisconnect);
+
+            _chkAutoPrompt = new CheckBox
+            {
+                Text = "Perguntar automaticamente ao plugar o cabo USB",
+                Location = new Point(lx, 214),
+                Size = new Size(lw, 22),
+                Checked = true,
+                ForeColor = Color.FromArgb(203, 213, 225)
+            };
+            Controls.Add(_chkAutoPrompt);
+
+            // Section 2: Windows Audio Source + VU
+            Controls.Add(MakeSectionLabel("2. FONTE DE ÁUDIO NO WINDOWS", lx, 248));
             _cmbAudio = new ComboBox
             {
-                Location = new Point(lx, 188),
-                Size = new Size(322, 28),
+                Location = new Point(lx, 270),
+                Size = new Size(422, 28),
                 DropDownStyle = ComboBoxStyle.DropDownList,
                 BackColor = Color.FromArgb(27, 32, 44),
                 ForeColor = Color.White,
@@ -4155,176 +2482,179 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
             };
             _cmbAudio.SelectedIndexChanged += delegate
             {
-                if (_updatingCombos) return;
-                AudioDeviceInfo sel = _cmbAudio.SelectedItem as AudioDeviceInfo;
-                if (sel != null)
-                {
-                    _capture.SelectDevice(sel.Id);
-                }
+                AudioDeviceInfo info = _cmbAudio.SelectedItem as AudioDeviceInfo;
+                if (info != null) _capture.SelectDevice(info.Id);
             };
-            var btnRefreshAudio = MakeSmallButton("Atualizar", lx + 330, 187, 78, 28);
+            var btnRefreshAudio = MakeButton("Atualizar", lx + 432, 269, 84, 28, Color.FromArgb(35, 43, 59));
             btnRefreshAudio.Click += delegate { RefreshAudioDevices(); };
 
-            _vuMeterHost = new Panel
+            _vuHost = new Panel
             {
-                Location = new Point(lx, 222),
+                Location = new Point(lx, 306),
                 Size = new Size(lw, 8),
                 BackColor = Color.FromArgb(12, 15, 22)
             };
-            _vuMeterBar = new Panel
+            _vuBar = new Panel
             {
                 Location = new Point(0, 0),
                 Size = new Size(0, 8),
                 BackColor = Color.FromArgb(34, 197, 94)
             };
-            _vuMeterHost.Controls.Add(_vuMeterBar);
-
-            var lblAudioTip = new Label
-            {
-                Text = "Dica: se não quiser som saindo no PC ao mesmo tempo, escolha uma saída silenciosa (ex.: monitor sem caixa).",
-                Location = new Point(lx, 234),
-                Size = new Size(lw, 32),
-                Font = new Font("Segoe UI", 8f),
-                ForeColor = Color.FromArgb(148, 163, 184)
-            };
+            _vuHost.Controls.Add(_vuBar);
             Controls.Add(_cmbAudio);
             Controls.Add(btnRefreshAudio);
-            Controls.Add(_vuMeterHost);
-            Controls.Add(lblAudioTip);
+            Controls.Add(_vuHost);
 
-            // Network interface
-            Controls.Add(MakeSectionLabel("3. REDE / INTERFACE PARA O QR CODE", lx, 274));
-            _cmbNetwork = new ComboBox
+            // Section 3: Adaptive Buffer & Gain
+            Controls.Add(MakeSectionLabel("3. LATÊNCIA ADAPTATIVA E VOLUME (PADRÃO 10 MS)", lx, 326));
+            var ctrlCard = new Panel
             {
-                Location = new Point(lx, 296),
-                Size = new Size(322, 28),
-                DropDownStyle = ComboBoxStyle.DropDownList,
-                BackColor = Color.FromArgb(27, 32, 44),
-                ForeColor = Color.White,
-                FlatStyle = FlatStyle.Flat
-            };
-            _cmbNetwork.SelectedIndexChanged += delegate
-            {
-                if (_updatingCombos) return;
-                RegenerateQr();
-            };
-            var btnRefreshNet = MakeSmallButton("Atualizar", lx + 330, 295, 78, 28);
-            btnRefreshNet.Click += delegate { RefreshAdbAndNetwork(true); };
-            Controls.Add(_cmbNetwork);
-            Controls.Add(btnRefreshNet);
-
-            // USB guide card
-            _usbGuideCard = new Panel
-            {
-                Location = new Point(lx, 336),
-                Size = new Size(lw, 148),
+                Location = new Point(lx, 348),
+                Size = new Size(lw, 154),
                 BackColor = Color.FromArgb(25, 31, 43)
             };
-            _lblUsbStatus = new Label
+
+            var lblMsTitle = new Label
             {
+                Text = "Buffer Alvo (1–120 ms):",
                 Location = new Point(12, 10),
-                Size = new Size(384, 22),
-                Font = new Font("Segoe UI", 9f, FontStyle.Bold),
+                Size = new Size(190, 20),
+                Font = new Font("Segoe UI", 9f, FontStyle.Bold)
+            };
+            _lblTargetMsVal = new Label
+            {
+                Text = "10 ms",
+                Location = new Point(400, 10),
+                Size = new Size(102, 20),
+                TextAlign = ContentAlignment.TopRight,
+                Font = new Font("Consolas", 10f, FontStyle.Bold),
                 ForeColor = Color.FromArgb(56, 189, 248)
             };
-            _lblUsbSteps = new Label
+            _trkTargetMs = new TrackBar
             {
-                Location = new Point(12, 34),
-                Size = new Size(384, 72),
-                Font = new Font("Segoe UI", 8.5f),
-                ForeColor = Color.FromArgb(203, 213, 225)
+                Location = new Point(10, 32),
+                Size = new Size(494, 34),
+                Minimum = 1,
+                Maximum = 120,
+                Value = 10,
+                TickFrequency = 10,
+                AutoSize = false
             };
-            _btnAdbTunnel = MakeSmallButton("Tentar Túnel ADB", 12, 110, 146, 28);
-            _btnAdbTunnel.Click += delegate
+            _trkTargetMs.Scroll += delegate
             {
-                RefreshAdbAndNetwork(true);
-                MessageBox.Show(this, _adbMessage, "Túnel ADB (Cabo USB)", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                int val = _trkTargetMs.Value;
+                _lblTargetMsVal.Text = val + " ms";
+                _adaptive.OnManualTargetChanged(val, _sessionClock.ElapsedMilliseconds);
+                SendTargetMsIfConnected(val);
             };
-            _usbGuideCard.Controls.Add(_lblUsbStatus);
-            _usbGuideCard.Controls.Add(_lblUsbSteps);
-            _usbGuideCard.Controls.Add(_btnAdbTunnel);
-            Controls.Add(_usbGuideCard);
 
+            _chkAutoOptimize = new CheckBox
+            {
+                Text = "Ajuste automático (reduz até 1 ms se liso; pergunta p/ estabilizar se cortar)",
+                Location = new Point(14, 70),
+                Size = new Size(490, 22),
+                Checked = true,
+                Font = new Font("Segoe UI", 8.25f),
+                ForeColor = Color.FromArgb(134, 239, 172)
+            };
+            _chkAutoOptimize.CheckedChanged += delegate
+            {
+                _adaptive.SetAutoOptimize(_chkAutoOptimize.Checked, _sessionClock.ElapsedMilliseconds);
+            };
+
+            var lblGainTitle = new Label
+            {
+                Text = "Ganho no Celular:",
+                Location = new Point(12, 100),
+                Size = new Size(150, 20),
+                Font = new Font("Segoe UI", 9f, FontStyle.Bold)
+            };
+            _lblGainVal = new Label
+            {
+                Text = "100%",
+                Location = new Point(400, 100),
+                Size = new Size(102, 20),
+                TextAlign = ContentAlignment.TopRight,
+                Font = new Font("Consolas", 9.5f, FontStyle.Bold),
+                ForeColor = Color.FromArgb(56, 189, 248)
+            };
+            _trkGain = new TrackBar
+            {
+                Location = new Point(10, 120),
+                Size = new Size(494, 28),
+                Minimum = 0,
+                Maximum = 150,
+                Value = 100,
+                TickFrequency = 25,
+                AutoSize = false
+            };
+            _trkGain.Scroll += delegate
+            {
+                _pendingGainPct = _trkGain.Value;
+                _lblGainVal.Text = _pendingGainPct + "%";
+                NativeUsbAudioClient c;
+                lock (_clientLock) { c = _usbClient; }
+                if (c != null && c.IsConnected) c.SendGainPct(_pendingGainPct);
+            };
+
+            ctrlCard.Controls.Add(lblMsTitle);
+            ctrlCard.Controls.Add(_lblTargetMsVal);
+            ctrlCard.Controls.Add(_trkTargetMs);
+            ctrlCard.Controls.Add(_chkAutoOptimize);
+            ctrlCard.Controls.Add(lblGainTitle);
+            ctrlCard.Controls.Add(_lblGainVal);
+            ctrlCard.Controls.Add(_trkGain);
+            Controls.Add(ctrlCard);
+
+            // Adaptive & Live Telemetry Labels
+            _lblAdaptiveStatus = new Label
+            {
+                Text = "Modo adaptativo: pronto em 10 ms",
+                Location = new Point(lx, 510),
+                Size = new Size(lw, 20),
+                Font = new Font("Segoe UI", 8.5f, FontStyle.Bold),
+                ForeColor = Color.FromArgb(56, 189, 248)
+            };
             _lblLiveDiag = new Label
             {
-                Text = "Telemetria ao vivo: aguardando conexão do celular...",
-                Location = new Point(lx, 492),
-                Size = new Size(lw, 34),
-                BackColor = Color.FromArgb(15, 19, 26),
+                Text = "Telemetria ao vivo: aguardando conexão USB...",
+                Location = new Point(lx, 534),
+                Size = new Size(lw, 36),
+                BackColor = Color.FromArgb(14, 17, 24),
                 ForeColor = Color.FromArgb(148, 163, 184),
-                Font = new Font("Consolas", 8f),
+                Font = new Font("Consolas", 8.25f),
                 TextAlign = ContentAlignment.MiddleLeft,
                 Padding = new Padding(8, 0, 8, 0)
             };
-            Controls.Add(_lblLiveDiag);
 
-            // Bottom utility buttons
-            _btnFirewall = MakeSmallButton("Liberar Firewall (Admin)", lx, 536, 198, 36);
-            _btnFirewall.Click += OnFirewallClick;
-
-            var btnHideTray = MakeSmallButton("Ocultar na Bandeja (^)", lx + 210, 536, 198, 36);
+            var btnHideTray = MakeButton("Ocultar na Bandeja (^)", lx, 578, lw, 30, Color.FromArgb(35, 43, 59));
             btnHideTray.Click += delegate { HideToTray(); };
 
-            Controls.Add(_btnFirewall);
+            Controls.Add(_lblAdaptiveStatus);
+            Controls.Add(_lblLiveDiag);
             Controls.Add(btnHideTray);
+        }
 
-            // Right column: QR Code Card
-            var qrCard = new Panel
-            {
-                Location = new Point(450, 78),
-                Size = new Size(308, 494),
-                BackColor = Color.FromArgb(25, 31, 43)
-            };
-            var lblQrTitle = new Label
-            {
-                Text = "ESCANEIE COM A CÂMERA DO CELULAR",
-                Location = new Point(14, 14),
-                Size = new Size(280, 20),
-                TextAlign = ContentAlignment.MiddleCenter,
-                Font = new Font("Segoe UI", 8.5f, FontStyle.Bold),
-                ForeColor = Color.FromArgb(148, 163, 184)
-            };
-            _picQr = new PictureBox
-            {
-                Location = new Point(24, 42),
-                Size = new Size(260, 260),
-                BackColor = Color.White,
-                SizeMode = PictureBoxSizeMode.Zoom
-            };
-            _txtUrl = new TextBox
-            {
-                Location = new Point(18, 316),
-                Size = new Size(272, 26),
-                ReadOnly = true,
-                TextAlign = HorizontalAlignment.Center,
-                BackColor = Color.FromArgb(15, 19, 26),
-                ForeColor = Color.FromArgb(56, 189, 248),
-                BorderStyle = BorderStyle.FixedSingle,
-                Font = new Font("Consolas", 9.5f, FontStyle.Bold)
-            };
-            _btnCopyUrl = MakeSmallButton("Copiar Link", 18, 350, 272, 32);
-            _btnCopyUrl.Click += delegate
-            {
-                if (!string.IsNullOrEmpty(_currentUrl))
-                {
-                    Clipboard.SetText(_currentUrl);
-                    _btnCopyUrl.Text = "Link copiado!";
-                }
-            };
-            _lblQrHint = new Label
-            {
-                Location = new Point(16, 392),
-                Size = new Size(276, 54),
-                TextAlign = ContentAlignment.TopCenter,
-                Font = new Font("Segoe UI", 8.25f),
-                ForeColor = Color.FromArgb(148, 163, 184)
-            };
-            qrCard.Controls.Add(lblQrTitle);
-            qrCard.Controls.Add(_picQr);
-            qrCard.Controls.Add(_txtUrl);
-            qrCard.Controls.Add(_btnCopyUrl);
-            qrCard.Controls.Add(_lblQrHint);
-            Controls.Add(qrCard);
+        private void BuildTray()
+        {
+            _trayMenu = new ContextMenuStrip();
+            var miOpen = new ToolStripMenuItem("Abrir janela", null, delegate { ShowFromTray(); });
+            miOpen.Font = new Font("Segoe UI", 9f, FontStyle.Bold);
+            _miStartup = new ToolStripMenuItem("Iniciar com o Windows", null, delegate { ToggleStartup(); });
+            _miStartup.Checked = IsStartupEnabled();
+            var miExit = new ToolStripMenuItem("Sair", null, delegate { ExitCleanly(); });
+
+            _trayMenu.Items.Add(miOpen);
+            _trayMenu.Items.Add(new ToolStripSeparator());
+            _trayMenu.Items.Add(_miStartup);
+            _trayMenu.Items.Add(miExit);
+
+            _trayIcon = new NotifyIcon();
+            _trayIcon.Text = "Phone Audio Bridge (USB Nativo)";
+            _trayIcon.Icon = CreateTrayIcon();
+            _trayIcon.ContextMenuStrip = _trayMenu;
+            _trayIcon.Visible = true;
+            _trayIcon.DoubleClick += delegate { ShowFromTray(); };
         }
 
         private static Label MakeSectionLabel(string text, int x, int y)
@@ -4339,7 +2669,7 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
             };
         }
 
-        private static Button MakeSmallButton(string text, int x, int y, int w, int h)
+        private static Button MakeButton(string text, int x, int y, int w, int h, Color bg)
         {
             var btn = new Button
             {
@@ -4347,7 +2677,7 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
                 Location = new Point(x, y),
                 Size = new Size(w, h),
                 FlatStyle = FlatStyle.Flat,
-                BackColor = Color.FromArgb(35, 43, 59),
+                BackColor = bg,
                 ForeColor = Color.White,
                 Cursor = Cursors.Hand,
                 Font = new Font("Segoe UI", 8.75f, FontStyle.Bold)
@@ -4357,354 +2687,530 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
             return btn;
         }
 
-        private void SetMode(BridgeMode mode)
-        {
-            _mode = mode;
-            bool isUsb = (mode == BridgeMode.Usb);
-
-            _btnWifi.BackColor = !isUsb ? Color.FromArgb(20, 48, 72) : Color.FromArgb(27, 32, 44);
-            _btnWifi.ForeColor = !isUsb ? Color.FromArgb(125, 211, 252) : Color.FromArgb(148, 163, 184);
-            _btnWifi.FlatAppearance.BorderColor = !isUsb ? Color.FromArgb(56, 189, 248) : Color.FromArgb(45, 55, 72);
-
-            _btnUsb.BackColor = isUsb ? Color.FromArgb(18, 52, 34) : Color.FromArgb(27, 32, 44);
-            _btnUsb.ForeColor = isUsb ? Color.FromArgb(134, 239, 172) : Color.FromArgb(148, 163, 184);
-            _btnUsb.FlatAppearance.BorderColor = isUsb ? Color.FromArgb(34, 197, 94) : Color.FromArgb(45, 55, 72);
-
-            if (_miModeWifi != null) _miModeWifi.Checked = !isUsb;
-            if (_miModeUsb != null) _miModeUsb.Checked = isUsb;
-
-            _capture.SetModeChunkMs(isUsb ? 10 : 20);
-            _server.UpdateProfile(mode, _capture.CurrentSampleRate, _capture.ActiveDeviceName);
-
-            SelectPreferredNetworkForMode();
-            UpdateGuideCardText();
-            RegenerateQr();
-        }
-
         private void RefreshAudioDevices()
         {
-            _updatingCombos = true;
-            try
-            {
-                AudioDeviceInfo current = _cmbAudio.SelectedItem as AudioDeviceInfo;
-                string prevId = current != null ? current.Id : "";
+            AudioDeviceInfo current = _cmbAudio.SelectedItem as AudioDeviceInfo;
+            string prevId = current != null ? current.Id : "";
 
-                var list = WasapiLoopbackCapture.ListOutputDevices();
-                _cmbAudio.Items.Clear();
-                int selIdx = 0;
-                for (int i = 0; i < list.Count; i++)
+            var list = WasapiLoopbackCapture.ListOutputDevices();
+            _cmbAudio.Items.Clear();
+            int selIdx = 0;
+            for (int i = 0; i < list.Count; i++)
+            {
+                _cmbAudio.Items.Add(list[i]);
+                if (!string.IsNullOrEmpty(prevId) && string.Equals(list[i].Id, prevId, StringComparison.Ordinal))
                 {
-                    _cmbAudio.Items.Add(list[i]);
-                    if (!string.IsNullOrEmpty(prevId) && string.Equals(list[i].Id, prevId, StringComparison.Ordinal))
-                    {
-                        selIdx = i;
-                    }
-                }
-                if (_cmbAudio.Items.Count > 0)
-                {
-                    _cmbAudio.SelectedIndex = selIdx;
+                    selIdx = i;
                 }
             }
-            finally
+            if (_cmbAudio.Items.Count > 0)
             {
-                _updatingCombos = false;
+                _cmbAudio.SelectedIndex = selIdx;
             }
         }
 
-        private void RefreshAdbAndNetwork(bool tryAdbReverse)
+        private void RefreshAdbDevices(bool rescanAdbPath)
         {
-            if (tryAdbReverse)
+            if (rescanAdbPath || string.IsNullOrEmpty(_adbExe))
             {
-                string msg;
-                _adbActive = NetworkHelper.TrySetupAdbReverse(DefaultPort, out msg);
-                _adbMessage = msg;
-                _server.AdbActive = _adbActive;
+                _adbExe = AdbHelper.FindAdbExecutable();
             }
 
-            _updatingCombos = true;
-            try
+            if (string.IsNullOrEmpty(_adbExe))
             {
-                NetEndpointOption prev = _cmbNetwork.SelectedItem as NetEndpointOption;
-                string prevIp = prev != null ? prev.IpAddress : "";
-                bool prevWasUsb = (prev != null && (prev.IsUsb || prev.IsAdb));
-
-                var eps = NetworkHelper.DiscoverEndpoints(_adbActive);
-                var usbIps = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                bool anyUsb = _adbActive;
-                _cmbNetwork.Items.Clear();
-                int foundIdx = -1;
-                for (int i = 0; i < eps.Count; i++)
-                {
-                    _cmbNetwork.Items.Add(eps[i]);
-                    if (eps[i].IsUsb || eps[i].IsAdb)
-                    {
-                        anyUsb = true;
-                        usbIps.Add(eps[i].IpAddress);
-                    }
-                    if (!string.IsNullOrEmpty(prevIp) && string.Equals(eps[i].IpAddress, prevIp, StringComparison.Ordinal))
-                    {
-                        foundIdx = i;
-                    }
-                }
-                _server.UsbDetected = anyUsb;
-                _server.UpdateUsbIps(usbIps);
-
-                if (_mode == BridgeMode.Usb && anyUsb && !prevWasUsb)
-                {
-                    foundIdx = -1;
-                }
-                else if (_mode == BridgeMode.Wifi && prevWasUsb)
-                {
-                    foundIdx = -1;
-                }
-
-                if (foundIdx >= 0)
-                {
-                    _cmbNetwork.SelectedIndex = foundIdx;
-                }
-                else
-                {
-                    SelectPreferredNetworkForMode();
-                }
-            }
-            finally
-            {
-                _updatingCombos = false;
-            }
-
-            UpdateGuideCardText();
-            RegenerateQr();
-        }
-
-        private void SelectPreferredNetworkForMode()
-        {
-            if (_cmbNetwork.Items.Count == 0) return;
-
-            _updatingCombos = true;
-            try
-            {
-                int best = 0;
-                if (_mode == BridgeMode.Usb)
-                {
-                    for (int i = 0; i < _cmbNetwork.Items.Count; i++)
-                    {
-                        NetEndpointOption opt = _cmbNetwork.Items[i] as NetEndpointOption;
-                        if (opt != null && (opt.IsAdb || opt.IsUsb))
-                        {
-                            best = i;
-                            break;
-                        }
-                    }
-                }
-                else
-                {
-                    for (int i = 0; i < _cmbNetwork.Items.Count; i++)
-                    {
-                        NetEndpointOption opt = _cmbNetwork.Items[i] as NetEndpointOption;
-                        if (opt != null && !opt.IsUsb && !opt.IsVirtual)
-                        {
-                            best = i;
-                            break;
-                        }
-                    }
-                }
-                _cmbNetwork.SelectedIndex = best;
-            }
-            finally
-            {
-                _updatingCombos = false;
-            }
-        }
-
-        private void UpdateGuideCardText()
-        {
-            NetEndpointOption sel = _cmbNetwork.SelectedItem as NetEndpointOption;
-            bool usbInterfaceReady = (sel != null && sel.IsUsb);
-            bool hasAdb = !string.IsNullOrEmpty(NetworkHelper.FindAdbExecutable());
-            _btnAdbTunnel.Visible = hasAdb;
-
-            if (_mode == BridgeMode.Usb)
-            {
-                if (_adbActive && sel != null && sel.IsAdb)
-                {
-                    _lblUsbStatus.ForeColor = Color.FromArgb(34, 197, 94);
-                    _lblUsbStatus.Text = "Cabo USB pronto via Túnel ADB (menor delay possível)";
-                    _lblUsbSteps.Text = "O túnel USB já está ativo na porta " + DefaultPort + ".\r\nBasta abrir ou escanear o link ao lado no navegador do celular e apertar Play.";
-                }
-                else if (usbInterfaceReady)
-                {
-                    _lblUsbStatus.ForeColor = Color.FromArgb(34, 197, 94);
-                    _lblUsbStatus.Text = "Cabo USB (Ancoragem USB) detectado automaticamente!";
-                    _lblUsbSteps.Text = "Interface ativa: " + sel.IpAddress + " (" + sel.InterfaceName + ").\r\nSe o celular não abrir a página, clique em 'Liberar Firewall (Admin)' abaixo.";
-                }
-                else
-                {
-                    _lblUsbStatus.ForeColor = Color.FromArgb(245, 158, 11);
-                    _lblUsbSteps.Text =
-                        "1. Conecte o celular no PC com cabo USB de dados.\r\n" +
-                        "2. No Android: Configurações > Rede / Roteador > ative 'Ancoragem USB' (USB Tethering).\r\n" +
-                        "   No iPhone: Ajustes > Acesso Pessoal > ative e selecione 'Confiar'.";
-                    _lblUsbStatus.Text = "Aguardando ativar Ancoragem USB no celular...";
-                }
-            }
-            else
-            {
-                _lblUsbStatus.ForeColor = Color.FromArgb(56, 189, 248);
-                _lblUsbStatus.Text = "Modo Wi-Fi / Rede Local ativo";
-                _lblUsbSteps.Text =
-                    "Celular e PC precisam estar na mesma rede (Wi-Fi/roteador).\r\n" +
-                    "Se quiser o menor delay possível para jogos ou filmes, plugue o cabo USB e mude para 'Cabo USB'.";
-            }
-        }
-
-        private void RegenerateQr()
-        {
-            NetEndpointOption sel = _cmbNetwork.SelectedItem as NetEndpointOption;
-            string ip = (sel != null && !string.IsNullOrEmpty(sel.IpAddress)) ? sel.IpAddress : "127.0.0.1";
-            string modeStr = (_mode == BridgeMode.Usb) ? "usb" : "wifi";
-            string url = string.Format("http://{0}:{1}/?mode={2}", ip, DefaultPort, modeStr);
-
-            if (string.Equals(url, _currentUrl, StringComparison.Ordinal))
-            {
+                _cmbDevices.Items.Clear();
+                _lblPhoneState.ForeColor = Color.FromArgb(248, 113, 113);
+                _lblPhoneState.Text = "adb.exe não encontrado — instale Google Platform-Tools ou coloque adb.exe na mesma pasta.";
                 return;
             }
-            _currentUrl = url;
-            _txtUrl.Text = url;
-            _btnCopyUrl.Text = "Copiar Link";
 
+            var devs = AdbHelper.ListOnlineDevices(_adbExe);
+            var presentSerials = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            AdbDeviceInfo prevSel = _cmbDevices.SelectedItem as AdbDeviceInfo;
+            string prevSerial = prevSel != null ? prevSel.Serial : _activeSerial;
+
+            _cmbDevices.Items.Clear();
+            int selIdx = 0;
+            for (int i = 0; i < devs.Count; i++)
+            {
+                presentSerials.Add(devs[i].Serial);
+                _cmbDevices.Items.Add(devs[i]);
+                if (!string.IsNullOrEmpty(prevSerial) && string.Equals(devs[i].Serial, prevSerial, StringComparison.OrdinalIgnoreCase))
+                {
+                    selIdx = i;
+                }
+            }
+            if (_cmbDevices.Items.Count > 0)
+            {
+                _cmbDevices.SelectedIndex = selIdx;
+            }
+
+            // Clear prompted serials once physically unplugged so replugging asks again!
+            var toRemove = new List<string>();
+            foreach (string s in _promptedSerials)
+            {
+                if (!presentSerials.Contains(s))
+                {
+                    toRemove.Add(s);
+                }
+            }
+            for (int i = 0; i < toRemove.Count; i++)
+            {
+                _promptedSerials.Remove(toRemove[i]);
+            }
+
+            NativeUsbAudioClient activeCli;
+            lock (_clientLock) { activeCli = _usbClient; }
+            bool connectedNow = activeCli != null && activeCli.IsConnected;
+
+            if (devs.Count == 0)
+            {
+                _lblPhoneState.ForeColor = Color.FromArgb(245, 158, 11);
+                _lblPhoneState.Text = "Nenhum celular Android USB detectado (ative Depuração USB no aparelho).";
+                return;
+            }
+
+            if (!connectedNow && !_connecting)
+            {
+                AdbDeviceInfo first = devs[0];
+                _lblPhoneState.ForeColor = Color.FromArgb(74, 222, 128);
+                _lblPhoneState.Text = "Celular pronto no cabo: " + first.DisplayLabel;
+
+                if (_autoConnectRequested)
+                {
+                    _autoConnectRequested = false;
+                    _promptedSerials.Add(first.Serial);
+                    ConnectDevice(first);
+                    return;
+                }
+
+                if (_chkAutoPrompt.Checked && !_popupOpen && !_promptedSerials.Contains(first.Serial))
+                {
+                    _promptedSerials.Add(first.Serial);
+                    PromptConnectOnPlug(first);
+                }
+            }
+        }
+
+        private void PromptConnectOnPlug(AdbDeviceInfo dev)
+        {
+            if (_popupOpen || _connecting) return;
+            _popupOpen = true;
             try
             {
-                QrMatrixResult qr = QrCodeGenerator.Encode(url);
-                Bitmap bmp = QrCodeGenerator.RenderBitmap(qr, 7, 4);
-                Bitmap old = _currentQrBmp;
-                _currentQrBmp = bmp;
-                _picQr.Image = bmp;
-                if (old != null) old.Dispose();
+                string title = "Celular USB detectado";
+                string head = dev.DisplayLabel;
+                string body = "Deseja conectar o áudio do PC neste aparelho pelo cabo USB agora?\n\n" +
+                    "O túnel nativo C++ AAudio inicia em ~1 segundo (padrão 10 ms), sem abrir navegador nem QR Code.";
+                using (var dlg = new DarkPromptDialog(title, head, body, "Sim, Conectar Áudio", "Não agora", Color.FromArgb(74, 222, 128)))
+                {
+                    if (dlg.ShowDialog(this) == DialogResult.Yes)
+                    {
+                        ConnectDevice(dev);
+                    }
+                }
+            }
+            finally
+            {
+                _popupOpen = false;
+            }
+        }
+
+        private void ConnectSelectedDevice()
+        {
+            AdbDeviceInfo sel = _cmbDevices.SelectedItem as AdbDeviceInfo;
+            if (sel == null)
+            {
+                RefreshAdbDevices(true);
+                sel = _cmbDevices.SelectedItem as AdbDeviceInfo;
+            }
+            if (sel == null)
+            {
+                MessageBox.Show(this, "Nenhum celular Android USB online encontrado. Plugue o cabo e autorize a Depuração USB.", "Phone Audio Bridge", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            _promptedSerials.Add(sel.Serial);
+            ConnectDevice(sel);
+        }
+
+        private void ConnectDevice(AdbDeviceInfo dev)
+        {
+            if (_connecting || dev == null) return;
+            DisconnectClientOnly(0, "", false);
+
+            _connecting = true;
+            _activeSerial = dev.Serial;
+            _activeModel = string.IsNullOrEmpty(dev.ModelFriendly) ? dev.Serial : dev.ModelFriendly;
+            _lastDisconnectReason = "";
+
+            _btnConnect.Enabled = false;
+            _btnDisconnect.Enabled = false;
+            _lblConnectionBadge.Text = "Conectando...";
+            _lblConnectionBadge.BackColor = Color.FromArgb(66, 46, 16);
+            _lblConnectionBadge.ForeColor = Color.FromArgb(251, 191, 36);
+            _lblPhoneState.ForeColor = Color.FromArgb(56, 189, 248);
+            _lblPhoneState.Text = "Preparando receptor nativo e túnel USB...";
+
+            int targetMs = _adaptive.TargetMs;
+            int rate = _capture.CurrentSampleRate > 8000 ? _capture.CurrentSampleRate : 48000;
+            int gainPct = _pendingGainPct;
+            string adbPath = _adbExe;
+
+            var bg = new Thread(delegate()
+            {
+                string err = "";
+                string instMsg;
+                if (!AdbHelper.EnsureReceiverInstalled(adbPath, dev.Serial, out instMsg))
+                {
+                    FinishConnectAttempt(false, null, instMsg);
+                    return;
+                }
+
+                UpdatePhoneStatusAsync(instMsg + " Abrindo túnel AAudio...");
+                if (!AdbHelper.SetupForwardAndLaunch(adbPath, dev.Serial, ForwardPort, targetMs, rate, gainPct, out err))
+                {
+                    FinishConnectAttempt(false, null, err);
+                    return;
+                }
+
+                var cli = new NativeUsbAudioClient();
+                cli.OnStatsReceived = delegate(ReceiverStats st)
+                {
+                    try
+                    {
+                        BeginInvoke((MethodInvoker)delegate
+                        {
+                            HandleStatsOnUi(st);
+                        });
+                    }
+                    catch { }
+                };
+                cli.OnDisconnected = delegate(int reason, string msg)
+                {
+                    try
+                    {
+                        BeginInvoke((MethodInvoker)delegate
+                        {
+                            HandleRemoteDisconnected(reason, msg);
+                        });
+                    }
+                    catch { }
+                };
+
+                if (!cli.Connect("127.0.0.1", ForwardPort, rate, targetMs, gainPct, out err))
+                {
+                    cli.Dispose();
+                    AdbHelper.RemoveForward(adbPath, dev.Serial, ForwardPort);
+                    FinishConnectAttempt(false, null, err);
+                    return;
+                }
+
+                FinishConnectAttempt(true, cli, "Conectado via USB Nativo!");
+            });
+            bg.IsBackground = true;
+            bg.Start();
+        }
+
+        private void UpdatePhoneStatusAsync(string text)
+        {
+            try
+            {
+                BeginInvoke((MethodInvoker)delegate
+                {
+                    if (_connecting) _lblPhoneState.Text = text;
+                });
+            }
+            catch { }
+        }
+
+        private void FinishConnectAttempt(bool ok, NativeUsbAudioClient cli, string statusMsg)
+        {
+            try
+            {
+                BeginInvoke((MethodInvoker)delegate
+                {
+                    _connecting = false;
+                    if (!ok || cli == null)
+                    {
+                        _btnConnect.Enabled = true;
+                        _btnDisconnect.Enabled = false;
+                        _lblConnectionBadge.Text = "Erro USB";
+                        _lblConnectionBadge.BackColor = Color.FromArgb(65, 22, 26);
+                        _lblConnectionBadge.ForeColor = Color.FromArgb(248, 113, 113);
+                        _lblPhoneState.ForeColor = Color.FromArgb(248, 113, 113);
+                        _lblPhoneState.Text = statusMsg;
+                        return;
+                    }
+
+                    lock (_clientLock)
+                    {
+                        _usbClient = cli;
+                    }
+                    long now = _sessionClock.ElapsedMilliseconds;
+                    _adaptive.Reset(_trkTargetMs.Value, now);
+                    _prevGlitchForRate = 0;
+                    _prevGlitchRateMs = now;
+                    _glitchesPerSec = 0;
+                    _lastPingMs = now;
+
+                    _btnConnect.Enabled = false;
+                    _btnDisconnect.Enabled = true;
+                    _lblConnectionBadge.Text = "USB AO VIVO";
+                    _lblConnectionBadge.BackColor = Color.FromArgb(18, 52, 34);
+                    _lblConnectionBadge.ForeColor = Color.FromArgb(74, 222, 128);
+                    _lblPhoneState.ForeColor = Color.FromArgb(74, 222, 128);
+                    _lblPhoneState.Text = string.Format("Conectado em {0} via localabstract (Zero HTTP/WebSocket)", _activeModel);
+                });
             }
             catch
             {
+                if (cli != null) cli.Dispose();
+            }
+        }
+
+        private void HandleStatsOnUi(ReceiverStats st)
+        {
+            if (st == null) return;
+            long now = _sessionClock.ElapsedMilliseconds;
+
+            if ((now - _prevGlitchRateMs) >= 1000)
+            {
+                uint curG = st.TotalGlitches;
+                uint diff = curG >= _prevGlitchForRate ? (curG - _prevGlitchForRate) : 0;
+                double sec = (now - _prevGlitchRateMs) / 1000.0;
+                _glitchesPerSec = (int)Math.Round(diff / Math.Max(0.2, sec));
+                _prevGlitchForRate = curG;
+                _prevGlitchRateMs = now;
             }
 
-            if (_mode == BridgeMode.Usb)
+            _adaptive.ProcessStats(st.TotalGlitches, now);
+
+            _lblAdaptiveStatus.Text = "Modo adaptativo: " + _adaptive.GetStatusLabelPt();
+            _lblAdaptiveStatus.ForeColor = (_adaptive.State == AdaptiveState.FloorLocked || _adaptive.State == AdaptiveState.Monitoring)
+                ? Color.FromArgb(74, 222, 128)
+                : (_adaptive.State == AdaptiveState.Stabilizing || _adaptive.State == AdaptiveState.PromptPending
+                    ? Color.FromArgb(251, 191, 36)
+                    : Color.FromArgb(56, 189, 248));
+
+            string flags = (st.IsLowLatency ? "LL" : "STD") + (st.IsExclusive ? "+EX" : "") + (st.IsMmap ? "+MMAP" : "");
+            _lblLiveDiag.Text = string.Format(
+                "AAudio {0} b={1} | Buf {2:0.0}ms (mín {3:0.0}ms) | Gap {4}ms | Cortes/s: {5} (P{6}/X{7}) | Ping {8}ms",
+                flags,
+                st.AAudioBurstFrames,
+                st.BufMs,
+                st.MinBufMs,
+                st.PktGapMaxMs,
+                _glitchesPerSec,
+                st.PlcTotal,
+                st.XRunTotal,
+                st.RttMs);
+            _lblLiveDiag.ForeColor = _glitchesPerSec > 0 ? Color.FromArgb(248, 113, 113) : Color.FromArgb(74, 222, 128);
+        }
+
+        private void ApplyTargetMsFromAdaptive(int newMs)
+        {
+            if (newMs < _trkTargetMs.Minimum) newMs = _trkTargetMs.Minimum;
+            if (newMs > _trkTargetMs.Maximum) newMs = _trkTargetMs.Maximum;
+            _trkTargetMs.Value = newMs;
+            _lblTargetMsVal.Text = newMs + " ms";
+            SendTargetMsIfConnected(newMs);
+            _lblAdaptiveStatus.Text = "Modo adaptativo: " + _adaptive.GetStatusLabelPt();
+        }
+
+        private void SendTargetMsIfConnected(int ms)
+        {
+            NativeUsbAudioClient c;
+            lock (_clientLock) { c = _usbClient; }
+            if (c != null && c.IsConnected)
             {
-                _lblQrHint.Text = "Perfil Cabo USB: blocos 10 ms · buffer 15 ms (Ring/Worklet).\r\nUse Túnel ADB para AudioWorklet 2,7 ms sem jitter.";
+                c.SendTargetMs(ms);
             }
-            else
+        }
+
+        private void ShowStabilizePrompt(int curMs, double gRate)
+        {
+            if (_popupOpen) return;
+            NativeUsbAudioClient c;
+            lock (_clientLock) { c = _usbClient; }
+            if (c == null || !c.IsConnected) return;
+
+            _popupOpen = true;
+            try
             {
-                _lblQrHint.Text = "Perfil Wi-Fi: blocos 20 ms · buffer 60 ms.\r\nEscaneie com a câmera do celular ou digite o link acima.";
+                string title = "Cortes detectados no áudio";
+                string head = string.Format("Cortes frequentes em {0} ms (~{1:0.0} cortes/s)", curMs, gRate);
+                string body = "Deseja que o app estabilize automaticamente aumentando o buffer aos poucos até zerar os cortes?\n\n" +
+                    "(Você pode voltar a diminuir o ms manualmente quando quiser.)";
+                using (var dlg = new DarkPromptDialog(title, head, body, "Sim, Estabilizar Agora", "Não, manter", Color.FromArgb(251, 191, 36)))
+                {
+                    if (dlg.ShowDialog(this) == DialogResult.Yes)
+                    {
+                        _adaptive.StartStabilizing(_sessionClock.ElapsedMilliseconds);
+                        ApplyTargetMsFromAdaptive(_adaptive.TargetMs);
+                    }
+                    else
+                    {
+                        _adaptive.DeclineStabilize(_sessionClock.ElapsedMilliseconds);
+                    }
+                }
             }
+            finally
+            {
+                _popupOpen = false;
+            }
+        }
+
+        private void HandleRemoteDisconnected(int reason, string msg)
+        {
+            DisconnectClientOnly(reason, msg, false);
+            if (!string.IsNullOrEmpty(_activeSerial))
+            {
+                // Keep in _promptedSerials when Bluetooth/phone turned off so it NEVER auto-reconnects or re-prompts
+                _promptedSerials.Add(_activeSerial);
+            }
+        }
+
+        private void DisconnectManual(string msg)
+        {
+            DisconnectClientOnly(0, msg, true);
+        }
+
+        private void DisconnectClientOnly(int reason, string msg, bool sendStop)
+        {
+            NativeUsbAudioClient old;
+            lock (_clientLock)
+            {
+                old = _usbClient;
+                _usbClient = null;
+            }
+            if (old != null)
+            {
+                if (sendStop) old.SendStopAndClose();
+                old.Dispose();
+            }
+            if (!string.IsNullOrEmpty(_adbExe) && !string.IsNullOrEmpty(_activeSerial))
+            {
+                AdbHelper.RemoveForward(_adbExe, _activeSerial, ForwardPort);
+            }
+
+            _lastDisconnectReason = msg;
+            _btnConnect.Enabled = true;
+            _btnDisconnect.Enabled = false;
+            _lblConnectionBadge.Text = reason == 1 ? "Fone desconectado" : "Aguardando USB";
+            _lblConnectionBadge.BackColor = Color.FromArgb(30, 41, 59);
+            _lblConnectionBadge.ForeColor = reason == 1 ? Color.FromArgb(245, 158, 11) : Color.FromArgb(56, 189, 248);
+
+            if (!string.IsNullOrEmpty(msg))
+            {
+                _lblPhoneState.ForeColor = reason == 1 ? Color.FromArgb(251, 191, 36) : Color.FromArgb(148, 163, 184);
+                _lblPhoneState.Text = msg;
+            }
+            _lblLiveDiag.ForeColor = Color.FromArgb(148, 163, 184);
+            _lblLiveDiag.Text = "Telemetria ao vivo: desconectado.";
+            WriteLiveSnapshot();
         }
 
         private void OnUiTick(object sender, EventArgs e)
         {
-            int clients = _server.ClientCount;
-            if (clients > 0)
+            float lvl = _capture.CurrentLevel;
+            int barW = (int)Math.Round(Math.Min(1f, Math.Max(0f, lvl)) * _vuHost.Width);
+            if (_vuBar.Width != barW)
             {
-                string tr = _server.ConnectedTransportSummary;
-                if (tr == "usb")
+                _vuBar.Width = barW;
+            }
+
+            long now = _sessionClock.ElapsedMilliseconds;
+            NativeUsbAudioClient activeCli;
+            lock (_clientLock) { activeCli = _usbClient; }
+            if (activeCli != null && activeCli.IsConnected && (now - _lastPingMs) >= 1500)
+            {
+                _lastPingMs = now;
+                activeCli.SendPing();
+            }
+
+            if ((now - _lastLiveJsonMs) >= 500)
+            {
+                _lastLiveJsonMs = now;
+                WriteLiveSnapshot();
+            }
+
+            _adbPollCounter++;
+            int pollEvery = (activeCli != null && activeCli.IsConnected) ? 25 : 12;
+            if (_adbPollCounter >= pollEvery)
+            {
+                _adbPollCounter = 0;
+                RefreshAdbDevices(false);
+            }
+        }
+
+        private void WriteLiveSnapshot()
+        {
+            try
+            {
+                NativeUsbAudioClient cli;
+                lock (_clientLock) { cli = _usbClient; }
+                bool conn = cli != null && cli.IsConnected;
+                ReceiverStats st = cli != null ? cli.LatestStats : null;
+
+                var sb = new StringBuilder();
+                sb.Append("{");
+                sb.AppendFormat("\"connected\":{0},", conn ? "true" : "false");
+                sb.AppendFormat("\"serial\":\"{0}\",", EscapeJson(_activeSerial));
+                sb.AppendFormat("\"model\":\"{0}\",", EscapeJson(_activeModel));
+                sb.AppendFormat("\"targetMs\":{0},", _adaptive.TargetMs);
+                sb.AppendFormat("\"gainPct\":{0},", _pendingGainPct);
+                sb.AppendFormat("\"adaptiveState\":\"{0}\",", _adaptive.State.ToString());
+                sb.AppendFormat("\"knownFloorMs\":{0},", _adaptive.KnownUnsafeFloorMs);
+                sb.AppendFormat("\"glitchesPerSec\":{0},", _glitchesPerSec);
+                sb.AppendFormat("\"disconnectReason\":\"{0}\",", EscapeJson(_lastDisconnectReason));
+                if (st != null)
                 {
-                    _lblStatusBadge.Text = string.Format("Transmitindo (USB) · {0}", clients);
-                    _lblStatusBadge.BackColor = Color.FromArgb(18, 52, 34);
-                    _lblStatusBadge.ForeColor = Color.FromArgb(74, 222, 128);
-                }
-                else if (tr == "wifi" && _mode == BridgeMode.Usb)
-                {
-                    _lblStatusBadge.Text = string.Format("Wi-Fi ativo · use QR USB", clients);
-                    _lblStatusBadge.BackColor = Color.FromArgb(66, 46, 16);
-                    _lblStatusBadge.ForeColor = Color.FromArgb(251, 191, 36);
+                    sb.AppendFormat("\"seqLast\":{0},", st.SeqLast);
+                    sb.AppendFormat(CultureInfo.InvariantCulture, "\"bufMs\":{0:0.0},", st.BufMs);
+                    sb.AppendFormat(CultureInfo.InvariantCulture, "\"minBufMs\":{0:0.0},", st.MinBufMs);
+                    sb.AppendFormat("\"pktGapMaxMs\":{0},", st.PktGapMaxMs);
+                    sb.AppendFormat("\"rttMs\":{0},", st.RttMs);
+                    sb.AppendFormat("\"plcTotal\":{0},", st.PlcTotal);
+                    sb.AppendFormat("\"xrunTotal\":{0},", st.XRunTotal);
+                    sb.AppendFormat("\"resyncTotal\":{0},", st.ResyncTotal);
+                    sb.AppendFormat("\"aaudioRate\":{0},", st.AAudioSampleRate);
+                    sb.AppendFormat("\"burstFrames\":{0},", st.AAudioBurstFrames);
+                    sb.AppendFormat("\"bufFrames\":{0},", st.AAudioBufFrames);
+                    sb.AppendFormat("\"aaudioLowLatency\":{0},", st.IsLowLatency ? "true" : "false");
+                    sb.AppendFormat("\"aaudioExclusive\":{0},", st.IsExclusive ? "true" : "false");
+                    sb.AppendFormat("\"aaudioMmap\":{0}", st.IsMmap ? "true" : "false");
                 }
                 else
                 {
-                    _lblStatusBadge.Text = string.Format("Transmitindo (Wi-Fi) · {0}", clients);
-                    _lblStatusBadge.BackColor = Color.FromArgb(18, 52, 34);
-                    _lblStatusBadge.ForeColor = Color.FromArgb(74, 222, 128);
+                    sb.Append("\"seqLast\":0,\"bufMs\":0,\"minBufMs\":0,\"pktGapMaxMs\":0,\"rttMs\":0,\"plcTotal\":0,\"xrunTotal\":0,\"resyncTotal\":0,\"aaudioRate\":0,\"burstFrames\":0,\"bufFrames\":0,\"aaudioLowLatency\":false,\"aaudioExclusive\":false,\"aaudioMmap\":false");
                 }
-            }
-            else if (!string.IsNullOrEmpty(_capture.LastError))
-            {
-                _lblStatusBadge.Text = "Erro de áudio";
-                _lblStatusBadge.BackColor = Color.FromArgb(65, 22, 26);
-                _lblStatusBadge.ForeColor = Color.FromArgb(248, 113, 113);
-            }
-            else
-            {
-                _lblStatusBadge.Text = "Aguardando celular...";
-                _lblStatusBadge.BackColor = Color.FromArgb(30, 41, 59);
-                _lblStatusBadge.ForeColor = Color.FromArgb(56, 189, 248);
-            }
+                sb.Append("}");
 
-            float lvl = _capture.CurrentLevel;
-            int barW = (int)Math.Round(Math.Min(1f, Math.Max(0f, lvl)) * _vuMeterHost.Width);
-            if (_vuMeterBar.Width != barW)
-            {
-                _vuMeterBar.Width = barW;
+                string path = Path.Combine(Path.GetTempPath(), "PhoneAudioBridge_live.json");
+                File.WriteAllText(path, sb.ToString(), Encoding.UTF8);
             }
-
-            bool hasGlitches;
-            string diagText = _server.GetLiveClientStatsSummary(out hasGlitches);
-            if (!string.Equals(_lblLiveDiag.Text, diagText, StringComparison.Ordinal))
+            catch
             {
-                _lblLiveDiag.Text = diagText;
-            }
-            if (clients == 0)
-            {
-                _lblLiveDiag.ForeColor = Color.FromArgb(148, 163, 184);
-            }
-            else if (hasGlitches)
-            {
-                _lblLiveDiag.ForeColor = Color.FromArgb(248, 113, 113);
-            }
-            else
-            {
-                _lblLiveDiag.ForeColor = Color.FromArgb(74, 222, 128);
-            }
-
-            _netTickDivider++;
-            int netInterval = clients > 0 ? 80 : 25;
-            if (_netTickDivider >= netInterval)
-            {
-                _netTickDivider = 0;
-                RefreshAdbAndNetwork(_mode == BridgeMode.Usb && clients == 0);
             }
         }
 
-        private void UpdateFirewallButtonState()
+        private static string EscapeJson(string s)
         {
-            if (NetworkHelper.IsFirewallRulePresent(DefaultPort))
-            {
-                _btnFirewall.Text = "Firewall Liberado (8765)";
-                _btnFirewall.ForeColor = Color.FromArgb(134, 239, 172);
-            }
-            else
-            {
-                _btnFirewall.Text = "Liberar Firewall (Admin)";
-                _btnFirewall.ForeColor = Color.White;
-            }
-        }
-
-        private void OnFirewallClick(object sender, EventArgs e)
-        {
-            string err;
-            bool ok = NetworkHelper.AddFirewallRuleElevated(DefaultPort, out err);
-            UpdateFirewallButtonState();
-            if (ok)
-            {
-                MessageBox.Show(this, "Porta TCP " + DefaultPort + " liberada no Firewall do Windows!", "Firewall", MessageBoxButtons.OK, MessageBoxIcon.Information);
-            }
-            else if (!string.IsNullOrEmpty(err))
-            {
-                MessageBox.Show(this, "Não foi possível alterar o Firewall: " + err, "Firewall", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            }
+            if (string.IsNullOrEmpty(s)) return "";
+            return s.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\r", " ").Replace("\n", " ");
         }
 
         private void HideToTray()
         {
             Hide();
-            _trayIcon.ShowBalloonTip(2000, "Phone Audio Bridge", "Rodando em segundo plano na bandeja (^).", ToolTipIcon.Info);
+            ShowInTaskbar = false;
+            _trayIcon.ShowBalloonTip(1800, "Phone Audio Bridge", "Rodando na bandeja (^). Detectará o cabo USB automaticamente.", ToolTipIcon.Info);
         }
 
         private void ShowFromTray()
         {
+            ShowInTaskbar = true;
             Show();
             WindowState = FormWindowState.Normal;
             Activate();
@@ -4716,31 +3222,26 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
             if (WindowState == FormWindowState.Minimized)
             {
                 Hide();
+                ShowInTaskbar = false;
             }
         }
 
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
-            if (!_forceExit && e.CloseReason == CloseReason.UserClosing && _server.ClientCount > 0)
+            NativeUsbAudioClient cli;
+            lock (_clientLock) { cli = _usbClient; }
+            bool active = cli != null && cli.IsConnected;
+
+            if (!_forceExit && e.CloseReason == CloseReason.UserClosing && active)
             {
                 DialogResult res = MessageBox.Show(
                     this,
-                    "Há um celular conectado recebendo áudio. Deseja apenas ocultar na bandeja (^) ou encerrar o aplicativo?\n\nSim = Ocultar na bandeja\nNão = Encerrar agora",
+                    "O áudio do PC está transmitindo pelo cabo USB. Deseja ocultar na bandeja (^) ou encerrar?\n\nSim = Ocultar na bandeja\nNão = Encerrar tudo",
                     "Phone Audio Bridge",
                     MessageBoxButtons.YesNoCancel,
                     MessageBoxIcon.Question);
-
-                if (res == DialogResult.Cancel)
-                {
-                    e.Cancel = true;
-                    return;
-                }
-                if (res == DialogResult.Yes)
-                {
-                    e.Cancel = true;
-                    HideToTray();
-                    return;
-                }
+                if (res == DialogResult.Cancel) { e.Cancel = true; return; }
+                if (res == DialogResult.Yes) { e.Cancel = true; HideToTray(); return; }
             }
 
             CleanupAll();
@@ -4760,17 +3261,12 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
                 _uiTimer.Stop();
                 _uiTimer.Dispose();
             }
+            DisconnectClientOnly(0, "Encerrado.", true);
             _capture.Dispose();
-            _server.Dispose();
             if (_trayIcon != null)
             {
                 _trayIcon.Visible = false;
                 _trayIcon.Dispose();
-            }
-            if (_currentQrBmp != null)
-            {
-                _currentQrBmp.Dispose();
-                _currentQrBmp = null;
             }
         }
 
@@ -4785,10 +3281,7 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
                     return val != null && val.ToString().Length > 0;
                 }
             }
-            catch
-            {
-                return false;
-            }
+            catch { return false; }
         }
 
         private void ToggleStartup()
@@ -4805,14 +3298,12 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
                     }
                     else
                     {
-                        key.SetValue(AppRunName, "\"" + Application.ExecutablePath + "\"");
+                        key.SetValue(AppRunName, "\"" + Application.ExecutablePath + "\" --minimized");
                         _miStartup.Checked = true;
                     }
                 }
             }
-            catch
-            {
-            }
+            catch { }
         }
 
         private static Icon CreateTrayIcon()
@@ -4872,98 +3363,59 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
         {
             NativeWin32.AttachConsole(NativeWin32.ATTACH_PARENT_PROCESS);
             string reportPath = args.Length >= 2 ? args[1] : "";
-            string qrPngPath = args.Length >= 3 ? args[2] : "";
 
             var sb = new StringBuilder();
             bool allOk = true;
 
-            // 1. WASAPI Enumeration & Loopback Probe
+            // 1. WASAPI Loopback Event-Driven Probe
             var devs = WasapiLoopbackCapture.ListOutputDevices();
             string probe = WasapiLoopbackCapture.ProbeLoopbackQuick("");
             bool wasapiOk = devs.Count >= 2 && probe.StartsWith("OK ", StringComparison.Ordinal);
             sb.AppendLine(string.Format("[{0}] WASAPI: count={1} probe={2}", wasapiOk ? "PASS" : "FAIL", devs.Count, probe));
             if (!wasapiOk) allOk = false;
 
-            // 2. Network Interface Discovery
-            var nets = NetworkHelper.DiscoverEndpoints(false);
-            bool netOk = nets.Count >= 1 && nets[0].IpAddress != "127.0.0.1";
-            sb.AppendLine(string.Format("[{0}] Network: count={1} primary={2}", netOk ? "PASS" : "FAIL", nets.Count, nets.Count > 0 ? nets[0].DisplayLabel : "none"));
-            if (!netOk) allOk = false;
-
-            // 3. QR Code Generator (V1-V5 RS syndromes & structural checks)
-            string[] testUrls = new string[]
+            // 2. Embedded PhoneAudioReceiver.apk Resource Verification
+            bool apkOk = false;
+            string apkInfo = "missing";
+            using (Stream s = AdbHelper.OpenEmbeddedApkStream())
             {
-                "http://192.168.15.5:8765/?mode=wifi",
-                "http://192.168.42.129:8765/?mode=usb",
-                "http://127.0.0.1:8765/?mode=usb",
-                "http://192.168.100.200:8765/?mode=wifi&extra=abcdefghijklmnopqrstuvwxyz123456"
-            };
-            bool qrOk = true;
-            for (int i = 0; i < testUrls.Length; i++)
-            {
-                QrMatrixResult qr = QrCodeGenerator.Encode(testUrls[i]);
-                bool rsOk = QrCodeGenerator.VerifyReedSolomonSyndromes(qr);
-                bool darkMod = qr.Modules[qr.Size - 8, 8];
-                if (!rsOk || !darkMod)
+                if (s != null && s.Length > 10000)
                 {
-                    qrOk = false;
-                }
-                sb.AppendLine(string.Format("  QR[{0}] len={1} V{2}-M size={3} mask={4} RS={5} darkMod={6}",
-                    i, testUrls[i].Length, qr.Version, qr.Size, qr.Mask, rsOk, darkMod));
-
-                if (i == 0 && !string.IsNullOrEmpty(qrPngPath))
-                {
-                    using (Bitmap bmp = QrCodeGenerator.RenderBitmap(qr, 8, 4))
+                    byte[] raw = new byte[s.Length];
+                    int got = 0;
+                    while (got < raw.Length)
                     {
-                        bmp.Save(qrPngPath, ImageFormat.Png);
+                        int n = s.Read(raw, got, raw.Length - got);
+                        if (n <= 0) break;
+                        got += n;
                     }
+                    bool zipMagic = got > 4 && raw[0] == (byte)'P' && raw[1] == (byte)'K';
+                    bool hasDex = ContainsAscii(raw, got, "classes.dex");
+                    bool hasSo = ContainsAscii(raw, got, "lib/arm64-v8a/libphoneaudioreceiver.so");
+                    apkOk = zipMagic && hasDex && hasSo;
+                    apkInfo = string.Format("bytes={0} zip={1} dex={2} arm64so={3}", got, zipMagic, hasDex, hasSo);
                 }
             }
-            sb.AppendLine(string.Format("[{0}] QRCode: all versions RS & structure verified", qrOk ? "PASS" : "FAIL"));
-            if (!qrOk) allOk = false;
+            sb.AppendLine(string.Format("[{0}] EmbeddedAPK: {1}", apkOk ? "PASS" : "FAIL", apkInfo));
+            if (!apkOk) allOk = false;
 
-            // 4. HTTP + WebSocket Server End-to-End Loopback Test
-            bool serverOk = false;
-            string serverDetails = "";
-            AudioWebServer srv = null;
-            try
-            {
-                srv = new AudioWebServer(0);
-                srv.UpdateProfile(BridgeMode.Usb, 48000, "Test Device");
-                srv.Start();
-                int port = srv.ListeningPort;
+            // 3. ADB Discovery Verification
+            string adbPath = AdbHelper.FindAdbExecutable();
+            bool adbOk = !string.IsNullOrEmpty(adbPath) && File.Exists(adbPath);
+            sb.AppendLine(string.Format("[{0}] ADB: path={1}", adbOk ? "PASS" : "FAIL", adbOk ? adbPath : "not found"));
+            if (!adbOk) allOk = false;
 
-                // Test GET /
-                string htmlResp = HttpGetText("127.0.0.1", port, "/?mode=usb");
-                bool htmlValid = htmlResp.Contains("200 OK") &&
-                    htmlResp.Contains("AudioWorklet") &&
-                    htmlResp.Contains("buildNetWorkerCode") &&
-                    htmlResp.Contains("loopbackAck") &&
-                    htmlResp.Contains("ringL") &&
-                    htmlResp.Contains("disconnectSession") &&
-                    !htmlResp.Contains("reconnectTimer") &&
-                    !htmlResp.Contains("resumeBtn");
+            // 4. Binary USB Protocol Round-Trip Verification
+            string protoDetails;
+            bool protoOk = TestBinaryProtocolRoundTrip(out protoDetails);
+            sb.AppendLine(string.Format("[{0}] BinaryProtocol: {1}", protoOk ? "PASS" : "FAIL", protoDetails));
+            if (!protoOk) allOk = false;
 
-                // Test GET /api/info
-                string infoResp = HttpGetText("127.0.0.1", port, "/api/info");
-                bool infoValid = infoResp.Contains("200 OK") && infoResp.Contains("\"mode\":\"usb\"") && infoResp.Contains("\"chunkMs\":10") && infoResp.Contains("\"targetBufferMs\":15") && infoResp.Contains("\"clientStats\":");
-
-                // Test WebSocket upgrade + config + ping->pong + stats->clientStats
-                bool wsValid = TestWebSocketHandshakeAndPing("127.0.0.1", port, out serverDetails);
-
-                serverOk = htmlValid && infoValid && wsValid;
-                sb.AppendLine(string.Format("[{0}] HTTP/WS Server: port={1} html={2} info={3} ws={4} ({5})",
-                    serverOk ? "PASS" : "FAIL", port, htmlValid, infoValid, wsValid, serverDetails));
-            }
-            catch (Exception ex)
-            {
-                sb.AppendLine("[FAIL] HTTP/WS Server exception: " + ex.Message);
-            }
-            finally
-            {
-                if (srv != null) srv.Dispose();
-            }
-            if (!serverOk) allOk = false;
+            // 5. AdaptiveLatencyController Deterministic Verification
+            string adaptDetails;
+            bool adaptOk = TestAdaptiveController(out adaptDetails);
+            sb.AppendLine(string.Format("[{0}] AdaptiveController: {1}", adaptOk ? "PASS" : "FAIL", adaptDetails));
+            if (!adaptOk) allOk = false;
 
             sb.AppendLine("OVERALL: " + (allOk ? "PASS" : "FAIL"));
             string report = sb.ToString();
@@ -4976,170 +3428,210 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
             return allOk ? 0 : 1;
         }
 
-        private static string HttpGetText(string host, int port, string path)
+        private static bool ContainsAscii(byte[] haystack, int len, string needle)
         {
-            using (var tcp = new TcpClient(host, port))
+            byte[] pat = Encoding.ASCII.GetBytes(needle);
+            int limit = len - pat.Length;
+            for (int i = 0; i <= limit; i++)
             {
-                tcp.ReceiveTimeout = 3000;
-                using (var ns = tcp.GetStream())
+                bool match = true;
+                for (int j = 0; j < pat.Length; j++)
                 {
-                    string req = string.Format("GET {0} HTTP/1.1\r\nHost: {1}:{2}\r\nConnection: close\r\n\r\n", path, host, port);
-                    byte[] reqBytes = Encoding.ASCII.GetBytes(req);
-                    ns.Write(reqBytes, 0, reqBytes.Length);
-                    using (var ms = new MemoryStream())
+                    if (haystack[i + j] != pat[j])
                     {
-                        byte[] buf = new byte[4096];
-                        int n;
-                        while ((n = ns.Read(buf, 0, buf.Length)) > 0)
-                        {
-                            ms.Write(buf, 0, n);
-                        }
-                        return Encoding.UTF8.GetString(ms.ToArray());
+                        match = false;
+                        break;
                     }
                 }
+                if (match) return true;
             }
+            return false;
         }
 
-        private static bool TestWebSocketHandshakeAndPing(string host, int port, out string info)
+        private static bool TestBinaryProtocolRoundTrip(out string details)
         {
-            info = "";
-            using (var tcp = new TcpClient(host, port))
+            details = "";
+            TcpListener srv = new TcpListener(IPAddress.Loopback, 0);
+            try
             {
-                tcp.NoDelay = true;
-                tcp.ReceiveTimeout = 3000;
-                using (var ns = tcp.GetStream())
-                {
-                    string wsKey = Convert.ToBase64String(Encoding.ASCII.GetBytes("PhoneAudioTest16"));
-                    string req = string.Format(
-                        "GET /ws HTTP/1.1\r\nHost: {0}:{1}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {2}\r\nSec-WebSocket-Version: 13\r\n\r\n",
-                        host, port, wsKey);
-                    byte[] reqBytes = Encoding.ASCII.GetBytes(req);
-                    ns.Write(reqBytes, 0, reqBytes.Length);
+                srv.Start();
+                int port = ((IPEndPoint)srv.LocalEndpoint).Port;
 
-                    // Read HTTP 101 headers
-                    byte[] hdrBuf = new byte[1024];
-                    int total = 0;
-                    while (total < hdrBuf.Length)
+                bool serverSawConfig = false;
+                bool serverSawPcm = false;
+                bool serverSawTarget = false;
+                bool serverSawStop = false;
+
+                var srvThread = new Thread(delegate()
+                {
+                    try
                     {
-                        int b = ns.ReadByte();
-                        if (b < 0) break;
-                        hdrBuf[total++] = (byte)b;
-                        if (total >= 4 && hdrBuf[total - 4] == 13 && hdrBuf[total - 3] == 10 && hdrBuf[total - 2] == 13 && hdrBuf[total - 1] == 10)
+                        using (TcpClient acc = srv.AcceptTcpClient())
+                        using (NetworkStream ns = acc.GetStream())
                         {
-                            break;
+                            acc.NoDelay = true;
+                            byte[] hdr = new byte[3];
+                            while (ReadExactTest(ns, hdr, 3))
+                            {
+                                byte t = hdr[0];
+                                ushort len = BridgeProtocol.ReadU16(hdr, 1);
+                                byte[] p = len > 0 ? new byte[len] : new byte[0];
+                                if (len > 0 && !ReadExactTest(ns, p, len)) break;
+
+                                if (t == BridgeProtocol.MsgConfig && len == 8)
+                                {
+                                    serverSawConfig = BridgeProtocol.ReadU32(p, 0) == 48000;
+                                    // Send mock STATS (0x81)
+                                    byte[] st = new byte[35];
+                                    st[0] = BridgeProtocol.MsgStats;
+                                    BridgeProtocol.WriteU16(st, 1, 32);
+                                    BridgeProtocol.WriteU32(st, 3, 1);
+                                    BridgeProtocol.WriteU16(st, 7, 105);   // 10.5 ms
+                                    BridgeProtocol.WriteU16(st, 9, 55);    // 5.5 ms min
+                                    BridgeProtocol.WriteU16(st, 11, 11);   // 11 ms gap
+                                    BridgeProtocol.WriteU16(st, 13, 192);  // burst
+                                    BridgeProtocol.WriteU16(st, 15, 384);  // buf
+                                    BridgeProtocol.WriteU16(st, 17, 1);    // LL
+                                    BridgeProtocol.WriteU32(st, 31, 48000);
+                                    ns.Write(st, 0, st.Length);
+                                    ns.Flush();
+                                }
+                                else if (t == BridgeProtocol.MsgPing && len == 8)
+                                {
+                                    byte[] pong = new byte[11];
+                                    pong[0] = BridgeProtocol.MsgPong;
+                                    BridgeProtocol.WriteU16(pong, 1, 8);
+                                    Buffer.BlockCopy(p, 0, pong, 3, 8);
+                                    ns.Write(pong, 0, pong.Length);
+                                    ns.Flush();
+                                }
+                                else if (t == BridgeProtocol.MsgPcm && len == 4 + 1920)
+                                {
+                                    serverSawPcm = true;
+                                }
+                                else if (t == BridgeProtocol.MsgSetTargetMs && len == 2)
+                                {
+                                    serverSawTarget = BridgeProtocol.ReadU16(p, 0) == 8;
+                                }
+                                else if (t == BridgeProtocol.MsgStop)
+                                {
+                                    serverSawStop = true;
+                                    break;
+                                }
+                            }
                         }
                     }
-                    string hdrText = Encoding.ASCII.GetString(hdrBuf, 0, total);
-                    if (!hdrText.Contains("101 Switching Protocols"))
+                    catch { }
+                });
+                srvThread.IsBackground = true;
+                srvThread.Start();
+
+                using (var cli = new NativeUsbAudioClient())
+                {
+                    string err;
+                    if (!cli.Connect("127.0.0.1", port, 48000, 10, 100, out err))
                     {
-                        info = "missing 101";
+                        details = "connect failed: " + err;
                         return false;
                     }
-
-                    // Read initial config frame from server
-                    string cfgMsg = ReadServerTextFrame(ns);
-                    if (!cfgMsg.Contains("\"type\":\"config\""))
-                    {
-                        info = "missing config frame";
-                        return false;
-                    }
-
-                    // Send 5 masked 1-byte binary ACK frames (loopback reverse-ACK fast path)
-                    byte[] ackFrame = BuildMaskedClientBinaryFrame(new byte[] { 0x06 });
-                    for (int i = 0; i < 5; i++)
-                    {
-                        ns.Write(ackFrame, 0, ackFrame.Length);
-                    }
-                    ns.Flush();
-
-                    // Send masked ping text frame
-                    byte[] pingPayload = Encoding.UTF8.GetBytes("{\"type\":\"ping\",\"t\":123}");
-                    byte[] pingFrame = BuildMaskedClientTextFrame(pingPayload);
-                    ns.Write(pingFrame, 0, pingFrame.Length);
-
-                    string pongMsg = ReadServerTextFrame(ns);
-                    if (!pongMsg.Contains("\"type\":\"pong\""))
-                    {
-                        info = "missing pong frame";
-                        return false;
-                    }
-
-                    // Send masked stats text frame and verify /api/info returns it
-                    byte[] statsPayload = Encoding.UTF8.GetBytes("{\"type\":\"stats\",\"engine\":\"Worklet+Worker\",\"bufMs\":12,\"minBufMs\":6,\"wsGapMaxMs\":11,\"plc\":0,\"plcPerSec\":0,\"resyncs\":0,\"rttMs\":1,\"targetMs\":15}");
-                    byte[] statsFrame = BuildMaskedClientTextFrame(statsPayload);
-                    ns.Write(statsFrame, 0, statsFrame.Length);
-                    ns.Flush();
-                    Thread.Sleep(80);
-
-                    string infoWithStats = HttpGetText(host, port, "/api/info");
-                    if (!infoWithStats.Contains("\"Worklet+Worker\"") || !infoWithStats.Contains("\"wsGapMaxMs\":11"))
-                    {
-                        info = "missing clientStats in /api/info";
-                        return false;
-                    }
-
-                    info = "101+config+ack5+pong+stats OK";
-                    return true;
+                    cli.EnqueuePcm(new byte[1920]);
+                    cli.SendTargetMs(8);
+                    cli.SendPing();
+                    Thread.Sleep(150);
+                    cli.SendStopAndClose();
                 }
+
+                srvThread.Join(1200);
+                bool statsParsed = serverSawConfig && serverSawPcm && serverSawTarget && serverSawStop;
+                details = string.Format("cfg={0} pcm={1} target={2} stop={3}", serverSawConfig, serverSawPcm, serverSawTarget, serverSawStop);
+                return statsParsed;
+            }
+            finally
+            {
+                try { srv.Stop(); } catch { }
             }
         }
 
-        private static byte[] BuildMaskedClientTextFrame(byte[] payload)
+        private static bool ReadExactTest(Stream s, byte[] buf, int count)
         {
-            return BuildMaskedClientFrame(0x81, payload);
+            int got = 0;
+            while (got < count)
+            {
+                int n = s.Read(buf, got, count - got);
+                if (n <= 0) return false;
+                got += n;
+            }
+            return true;
         }
 
-        private static byte[] BuildMaskedClientBinaryFrame(byte[] payload)
+        private static bool TestAdaptiveController(out string details)
         {
-            return BuildMaskedClientFrame(0x82, payload);
-        }
+            // Scenario 1: Silent downshift 10 -> 9 -> 8, glitch on probe rolls back 8 -> 9 + locks floor
+            var c1 = new AdaptiveLatencyController(10);
+            c1.Reset(10, 0);
+            c1.ProcessStats(0, 500);
+            c1.ProcessStats(0, 1600);   // exits Warmup -> Monitoring (zeroStart=1600)
+            c1.ProcessStats(0, 7800);   // +6200ms clean -> downshift to 9 (ProbingDown, stateStart=7800)
+            if (c1.TargetMs != 9 || c1.State != AdaptiveState.ProbingDown)
+            {
+                details = string.Format("S1 step1 fail: ms={0} st={1}", c1.TargetMs, c1.State);
+                return false;
+            }
+            c1.ProcessStats(0, 11400);  // +3600ms clean -> back to Monitoring (zeroStart=11400)
+            c1.ProcessStats(0, 17600);  // +6200ms clean -> downshift to 8 (ProbingDown)
+            if (c1.TargetMs != 8 || c1.State != AdaptiveState.ProbingDown)
+            {
+                details = string.Format("S1 step2 fail: ms={0} st={1}", c1.TargetMs, c1.State);
+                return false;
+            }
+            c1.ProcessStats(1, 18200);  // glitch during probe -> rollback to 9 + FloorLocked (unsafe=8)
+            if (c1.TargetMs != 9 || c1.State != AdaptiveState.FloorLocked || c1.KnownUnsafeFloorMs != 8)
+            {
+                details = string.Format("S1 rollback fail: ms={0} st={1} floor={2}", c1.TargetMs, c1.State, c1.KnownUnsafeFloorMs);
+                return false;
+            }
+            c1.ProcessStats(1, 30000);  // remains locked at 9 ms
+            if (c1.TargetMs != 9)
+            {
+                details = "S1 drift after lock";
+                return false;
+            }
 
-        private static byte[] BuildMaskedClientFrame(byte firstByte, byte[] payload)
-        {
-            byte[] mask = new byte[] { 0x12, 0x34, 0x56, 0x78 };
-            int hdrLen = payload.Length <= 125 ? 6 : 8;
-            byte[] frame = new byte[hdrLen + payload.Length];
-            frame[0] = firstByte;
-            if (payload.Length <= 125)
+            // Scenario 2: Sustained glitches -> stabilize prompt -> Yes -> ramps 10->12->14 -> locks after 4s clean
+            var c2 = new AdaptiveLatencyController(10);
+            int promptedAt = -1;
+            c2.OnStabilizePromptRequested = delegate(int ms, double rate) { promptedAt = ms; };
+            c2.Reset(10, 0);
+            c2.ProcessStats(0, 500);
+            c2.ProcessStats(0, 1600);   // Monitoring
+            c2.ProcessStats(2, 2200);
+            c2.ProcessStats(4, 3000);   // 4 glitches in <3s -> PromptPending
+            if (promptedAt != 10 || c2.State != AdaptiveState.PromptPending)
             {
-                frame[1] = (byte)(0x80 | payload.Length);
-                Buffer.BlockCopy(mask, 0, frame, 2, 4);
+                details = string.Format("S2 prompt fail: promptedAt={0} st={1}", promptedAt, c2.State);
+                return false;
             }
-            else
+            c2.StartStabilizing(3200);  // immediate step 10 -> 12
+            if (c2.TargetMs != 12 || c2.State != AdaptiveState.Stabilizing)
             {
-                frame[1] = (byte)(0x80 | 126);
-                frame[2] = (byte)((payload.Length >> 8) & 0xFF);
-                frame[3] = (byte)(payload.Length & 0xFF);
-                Buffer.BlockCopy(mask, 0, frame, 4, 4);
+                details = string.Format("S2 ramp1 fail: ms={0} st={1}", c2.TargetMs, c2.State);
+                return false;
             }
-            for (int i = 0; i < payload.Length; i++)
+            c2.ProcessStats(5, 5800);   // glitch >= 2.5s later -> ramp 12 -> 14
+            if (c2.TargetMs != 14)
             {
-                frame[hdrLen + i] = (byte)(payload[i] ^ mask[i & 3]);
+                details = string.Format("S2 ramp2 fail: ms={0}", c2.TargetMs);
+                return false;
             }
-            return frame;
-        }
+            c2.ProcessStats(5, 10000);  // >4.0s with 0 delta -> FloorLocked at 14
+            if (c2.State != AdaptiveState.FloorLocked || c2.TargetMs != 14)
+            {
+                details = string.Format("S2 lock fail: ms={0} st={1}", c2.TargetMs, c2.State);
+                return false;
+            }
 
-        private static string ReadServerTextFrame(NetworkStream ns)
-        {
-            int b0 = ns.ReadByte();
-            int b1 = ns.ReadByte();
-            if (b0 < 0 || b1 < 0) return "";
-            int len = b1 & 0x7F;
-            if (len == 126)
-            {
-                int hi = ns.ReadByte();
-                int lo = ns.ReadByte();
-                len = (hi << 8) | lo;
-            }
-            byte[] data = new byte[len];
-            int read = 0;
-            while (read < len)
-            {
-                int n = ns.Read(data, read, len - read);
-                if (n <= 0) break;
-                read += n;
-            }
-            return Encoding.UTF8.GetString(data, 0, read);
+            details = "downshift 10->9->8 rollback->9 lock=8; stabilize 10->12->14 lock";
+            return true;
         }
     }
 
@@ -5153,15 +3645,14 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
                 return SelfTestRunner.Run(args);
             }
 
-            BridgeMode startMode = BridgeMode.Wifi;
+            bool startMinimized = false;
+            bool autoConnect = false;
             if (args != null)
             {
                 for (int i = 0; i < args.Length; i++)
                 {
-                    if (string.Equals(args[i], "--usb", StringComparison.OrdinalIgnoreCase))
-                    {
-                        startMode = BridgeMode.Usb;
-                    }
+                    if (string.Equals(args[i], "--minimized", StringComparison.OrdinalIgnoreCase)) startMinimized = true;
+                    if (string.Equals(args[i], "--auto-connect", StringComparison.OrdinalIgnoreCase)) autoConnect = true;
                 }
             }
 
@@ -5180,7 +3671,7 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
 
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
-                Application.Run(new MainBridgeForm(startMode));
+                Application.Run(new MainBridgeForm(startMinimized, autoConnect));
                 return 0;
             }
         }

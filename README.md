@@ -1,6 +1,6 @@
 # Projetinhos de PC
 
-Coleção de utilitários nativos sob medida para Windows (além de configurações personalizadas de jogo) criados para resolver necessidades reais do dia a dia — controle direto de periféricos sem software pesado em segundo plano, ponte de áudio para celular com QR Code, automação inteligente ligada a jogos, indicadores em tempo real na bandeja do sistema e binds de treino no CS2.
+Coleção de utilitários nativos sob medida para Windows (além de configurações personalizadas de jogo) criados para resolver necessidades reais do dia a dia — controle direto de periféricos sem software pesado em segundo plano, ponte nativa de áudio Windows → Android via cabo USB/ADB (C++ AAudio), automação inteligente ligada a jogos, indicadores em tempo real na bandeja do sistema e binds de treino no CS2.
 
 ---
 
@@ -21,7 +21,7 @@ Todos os utilitários seguem quatro princípios:
 2. **Zero dependências externas de runtime:**
    Os utilitários em C# são compilados diretamente pelo compilador nativo do **.NET Framework 4.x** (`csc.exe`) que já vem instalado em todo Windows 10/11 — basta um único executável leve ou scripts PowerShell/VBScript nativos.
 3. **Automação orientada a eventos reais:**
-   Os programas reagem ao contexto real de uso: detectam quando o *League of Legends* abre ou fecha, ajustam automaticamente o *polling rate* de 8000 Hz para 1000 Hz durante a partida, oferecem um pop-up sob demanda para carregar ou bloquear mods/overlays, detectam interfaces USB de celular plugadas no cabo e atualizam ícones sem roubar o foco da tela cheia.
+   Os programas reagem ao contexto real de uso: detectam quando o *League of Legends* abre ou fecha, ajustam automaticamente o *polling rate* de 8000 Hz para 1000 Hz durante a partida, oferecem um pop-up sob demanda para carregar ou bloquear mods/overlays, detectam o celular Android plugado no cabo USB com pop-up de conexão e atualizam ícones sem roubar o foco da tela cheia.
 4. **Higiene de execução e estabilidade:**
    - **Instância única (`Mutex`)** para nunca duplicar processos.
    - **Limpeza de recursos** (destruição explícita de ícones `HICON` no GDI+, encerramento limpo da bandeja sem ícones fantasma e restauração de arquivos sem BOM).
@@ -36,7 +36,7 @@ Todos os utilitários seguem quatro princípios:
 | **ATK DPI & Polling Rate Quick Switch** | [`atk-dpi-quick-switch/`](./atk-dpi-quick-switch/README.md) | Troca instantânea de DPI (800 / 1600 / 3200) e Polling Rate (1K ↔ 8K) via atalhos globais com OSD flutuante e redução automática para 1000 Hz no LoL para evitar travamentos no motor do jogo. | C# (.NET 4.x), Win32 HID (`hid.dll` / `setupapi.dll`), `RegisterHotKey` + `Raw Input`, WinForms + GDI+, PowerShell |
 | **Rose & LTK AutoSync** | [`rose-ltk-autosync/`](./rose-ltk-autosync/README.md) | Garante que Rose, LTK Manager, Pengu Loader e Porofessor/Overwolf não fiquem abertos fora do LoL; ao abrir o cliente, abre o Porofessor e pergunta se você quer ativar Rose/LTK naquela sessão. | PowerShell, VBScript (`WScript.Shell`), Windows Task Scheduler, Registro (IFEO), WMI/CIM |
 | **Peripheral Battery Tray** | [`peripheral-battery-tray/`](./peripheral-battery-tray/README.md) | Mostra a bateria em tempo real com **1 ícone separado por periférico** na bandeja oculta (`^`) do Windows (ATK X1 Ultimate 2.0, Corsair HS80 RGB e Bluetooth automático). | C# (.NET 4.x), Win32 HID Overlapped I/O, protocolo Corsair Bragi, SetupAPI Bluetooth (`DEVPKEY_Bluetooth_Battery`), WinForms + GDI+ |
-| **Phone Audio Bridge** | [`phone-audio-bridge/`](./phone-audio-bridge/README.md) | Transforma o celular em ponte para usar fone Bluetooth no PC sem adaptador Bluetooth: captura o áudio do Windows (WASAPI Event-Driven + MMCSS Pro Audio), gera um QR Code e transmite via **Wi-Fi** ou **Cabo USB (10–15 ms)** para um Ring-Buffer `AudioWorklet` (controlador PI + Hermite + PLC) no navegador. | C# (.NET 4.x), WASAPI Loopback Event-Driven (`avrt.dll` Pro Audio), Servidor HTTP + WebSocket (RFC 6455), QR Code ISO 18004, `AudioWorklet` / Ring Buffer, Túnel ADB/USB Tethering |
+| **Phone Audio Bridge** | [`phone-audio-bridge/`](./phone-audio-bridge/README.md) | Transforma o celular Android em receptor de áudio **100% nativo via Cabo USB (ADB)** para usar fone Bluetooth no PC sem adaptador Bluetooth nem navegador: captura WASAPI Event-Driven (`10 ms` + keepalive em silêncio), abre pop-up automático ao plugar o cabo, implanta sozinho o mini-APK C++ **AAudio** (`localabstract` Unix socket, zero TCP/Nagle) e traz controle adaptativo de latência (`10 → 1 ms` silencioso ou auto-estabilização sob demanda). | C# (.NET 4.x), WASAPI Loopback (`avrt.dll` Pro Audio), `adb forward localabstract`, Android NDK C++17 (`libaaudio`), JNI, `ForegroundService` (`mediaPlayback`) |
 | **CS2 Treino & Binds** | [`cs2-treino-binds/`](./cs2-treino-binds/README.md) | Arquivos `.cfg` prontos para treino no Counter-Strike 2: modo treino livre de granadas/spray com binds (`V`, `I`, `K`, `O`, `P`), modo vs 10 bots difíceis (`treino2`), `autoexec.cfg` e instalador automático. | Source 2 CFG (`treino.cfg`, `treino2.cfg`, `autoexec.cfg`), PowerShell |
 
 ---
@@ -49,7 +49,7 @@ Todos os utilitários seguem quatro princípios:
   * **WASAPI Loopback (`IMMDeviceEnumerator`, `IAudioClient`, `IAudioCaptureClient`)**: captura direta do fluxo de áudio do Windows sem drivers virtuais nem bibliotecas externas.
   * `kernel32.dll` / `winmm.dll`: I/O assíncrono (`FILE_FLAG_OVERLAPPED` + `CancelIoEx`) e temporização precisa (`timeBeginPeriod`).
   * `user32.dll`: atalhos globais (`RegisterHotKey`), captura direta de teclado (`Raw Input`), janelas OSD sem roubar foco (`WS_EX_NOACTIVATE`) e gerenciamento de handles `HICON`.
-* **Rede, WebSocket & Web Audio API:** Servidor TCP/HTTP/WebSocket (RFC 6455) em C# com fila anti-atraso, gerador de QR Code ISO/IEC 18004 com Reed-Solomon, player HTML5/Web Audio com micro-PLL adaptativo e suporte a USB Tethering / `adb reverse`.
+* **Túnel USB/ADB Nativo & AAudio C++ (JNI/NDK):** Ponte direta via `adb forward` + socket Unix `localabstract` com protocolo binário enxuto (sem HTTP, sem WebSocket, sem navegador e sem firewall), alimentando um Ring-Buffer *lock-free* em C++17 com reamostragem cúbica de Hermite + controlador PI + AAudio `PERFORMANCE_MODE_LOW_LATENCY` em `ForegroundService` no Android.
 * **Windows Forms + GDI+:** Renderização dinâmica de ícones 32×32 na bandeja do sistema, QR Codes nítidos e cards visuais com transparência e bordas arredondadas.
 * **PowerShell + VBScript (`wscript.exe`):** Automação de sistema, manipulação de processos, regras de Firewall e criação de tarefas agendadas; o `.vbs` permite rodar o monitor PowerShell em segundo plano sem piscar janela de console.
 * **Windows Task Scheduler & Registro (`HKCU` / `HKLM`):** Inicialização automática com ou sem elevação (Admin/UIPI), configuração de persistência e controle de ganchos *Image File Execution Options (IFEO)*.
@@ -79,10 +79,10 @@ projetinhos_de_pc/
 │   ├── build.ps1                  # Compila PeripheralBatteryTray.exe com csc.exe
 │   └── README.md                  # Documentação detalhada e explicação sobre limitações 2.4 GHz
 ├── phone-audio-bridge/
-│   ├── LiberarFirewall.ps1        # Abre porta TCP 8765 no Firewall do Windows (Admin)
-│   ├── Program.cs                 # Código-fonte C# (WASAPI, HTTP/WS, QR Code, Player HTML5, UI)
-│   ├── build.ps1                  # Compila PhoneAudioBridge.exe com csc.exe
-│   └── README.md                  # Guia completo de uso em Wi-Fi e Cabo USB (menor delay)
+│   ├── android/                   # Receptor Android nativo C++17 AAudio + JNI (sem Gradle)
+│   ├── Program.cs                 # App Windows C# (WASAPI, ADB auto-deploy, latência adaptativa, UI/bandeja)
+│   ├── build.ps1                  # Compila APK (opcional) + embute no PhoneAudioBridge.exe via csc.exe
+│   └── README.md                  # Guia completo da arquitetura USB/ADB nativa v2.0
 └── rose-ltk-autosync/
     ├── ConfigurarTarefasRose.ps1  # Configura tarefas \Rose e \RoseAutoSync + limpeza IFEO
     ├── RoseAutoSync.ps1           # Monitor em loop (LoL, Rose, LTK, Pengu, Porofessor)
@@ -137,7 +137,7 @@ cd projetinhos_de_pc
   .\build.ps1
   Start-Process .\PhoneAudioBridge.exe
   ```
-  *(Escaneie o QR Code no celular para ouvir no fone Bluetooth; use o modo **Cabo USB** com Ancoragem USB ou túnel ADB para menor delay — veja [`phone-audio-bridge/README.md`](./phone-audio-bridge/README.md).)*
+  *(Ao plugar o celular Android via cabo USB com Depuração USB ativa, o app exibe um pop-up para instalar/conectar o receptor nativo C++ AAudio automaticamente em 1 clique — veja [`phone-audio-bridge/README.md`](./phone-audio-bridge/README.md).)*
 
 * **CS2 Treino & Binds:**
   ```powershell
