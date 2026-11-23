@@ -1,3 +1,7 @@
+param(
+    [switch]$CopyToDesktop
+)
+
 $ErrorActionPreference = 'Stop'
 
 $dir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -20,3 +24,17 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Write-Output "Build succeeded: $out"
+
+if ($CopyToDesktop) {
+    $desktopDir = [Environment]::GetFolderPath('Desktop')
+    if ([string]::IsNullOrWhiteSpace($desktopDir)) {
+        throw "Could not resolve Desktop path."
+    }
+    $desktopExe = Join-Path $desktopDir 'PhoneAudioBridge.exe'
+    Get-Process -Name 'PhoneAudioBridge' -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -eq $desktopExe } |
+        Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 200
+    Copy-Item -Path $out -Destination $desktopExe -Force
+    Write-Output "Copied executable to Desktop: $desktopExe"
+}

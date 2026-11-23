@@ -49,6 +49,12 @@ cd phone-audio-bridge
 ```
 Isso gera `PhoneAudioBridge.exe` na mesma pasta.
 
+Para já compilar e copiar o executável portátil direto para a sua **Área de Trabalho**:
+```powershell
+.\build.ps1 -CopyToDesktop
+```
+*(O `PhoneAudioBridge.exe` é arquivo único portátil — não precisa de DLLs nem de outros arquivos ao lado.)*
+
 ### 2. Executar o aplicativo
 ```powershell
 Start-Process .\PhoneAudioBridge.exe
@@ -69,6 +75,14 @@ powershell -ExecutionPolicy Bypass -File .\LiberarFirewall.ps1
 3. Conecte seu fone Bluetooth no celular, escaneie o QR Code e toque em **Conectar e Ouvir Áudio**.
 
 > **Dica sobre o som no PC:** Como a captura usa *WASAPI Loopback*, o app copia o áudio que está tocando na saída selecionada no Windows. Se você não quiser ouvir o som simultaneamente em outra caixa/headset do PC, selecione como saída no Windows um monitor sem alto-falantes ligados (ou reduza o volume físico da caixa) e deixe o volume do Windows normal — ou ajuste o dispositivo desejado no combo **Fonte de Áudio**.
+
+---
+
+## O que acontece se eu desligar e ligar o Bluetooth do celular?
+
+* **A conexão PC ↔ celular (Wi-Fi ou Cabo USB) continua ativa:** o Bluetooth existe apenas entre o **celular e o fone**. Você **não precisa** reiniciar o app no PC nem escanear o QR Code de novo.
+* **Ao desligar o Bluetooth:** o fone desconecta do celular e, por padrão no Android/iOS, o sistema costuma pausar/suspender o áudio da aba (`AudioContext`) para evitar que o som do PC saia de repente no alto-falante do telefone.
+* **Ao religar o Bluetooth e reconectar o fone:** o player detecta a troca de dispositivo/foco e tenta retomar o áudio automaticamente na mesma aba. Se o navegador mantiver o áudio suspenso por restrição do sistema (ex.: tela bloqueada), basta abrir a aba já conectada e tocar no botão **Retomar Áudio** (ou **Desconectar** → **Conectar e Ouvir Áudio**).
 
 ---
 
