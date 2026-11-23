@@ -1280,7 +1280,7 @@ namespace PhoneAudioBridge
         public const string PackageName = "com.antoniociorcero.phoneaudiobridge";
         public const string ActivityName = "com.antoniociorcero.phoneaudiobridge/.BridgeActivity";
         public const string AbstractSocket = "localabstract:phoneaudiobridge";
-        public const string ExpectedVersionCodeMarker = "versionCode=2";
+        public const string ExpectedVersionCodeMarker = "versionCode=3";
         public const string ResourceName = "PhoneAudioReceiver.apk";
 
         public static string FindAdbExecutable()
@@ -1426,7 +1426,7 @@ namespace PhoneAudioBridge
 
             if (!alreadyCurrent)
             {
-                string tempApk = Path.Combine(Path.GetTempPath(), "PhoneAudioReceiver_v2.apk");
+                string tempApk = Path.Combine(Path.GetTempPath(), "PhoneAudioReceiver_v3.apk");
                 using (Stream res = OpenEmbeddedApkStream())
                 {
                     if (res == null)

@@ -56,11 +56,11 @@ O motor de controle adaptativo (`AdaptiveLatencyController`) busca o menor atras
 
 ---
 
-## Desconexão limpa ao desligar o Bluetooth (sem reconectar sozinho)
+## Troca automática entre Fone e Alto-falante (e desconexão manual)
 
-* O `AudioBridgeService` monitora simultaneamente **`ACTION_AUDIO_BECOMING_NOISY`**, **`AudioDeviceCallback.onAudioDevicesRemoved`** (A2DP, BLE Audio, fones com fio/USB-C) e o **`errorCallback` (`AAUDIO_ERROR_DISCONNECTED`)** do AAudio.
-* Ao desligar o Bluetooth ou remover o fone — mesmo com a tela do celular apagada — o receptor nativo **encerra imediatamente** o AAudio, envia o sinal `0x86` ao PC para desligar o envio, fecha o túnel e encerra o serviço (`START_NOT_STICKY`).
-* O app nunca se registra para eventos de reconexão Bluetooth e mantém o aparelho silenciado no Watcher até que você desconecte/reconecte o cabo ou clique manualmente em **Conectar e Ouvir Agora**.
+* **Com fone ou sem fone:** se você conectar sem fone, o áudio já toca direto no **alto-falante do celular** (com atraso mínimo, sem Bluetooth).
+* **Troca automática ao vivo (`v2.1` / `versionCode=3`):** o `AudioBridgeService` monitora `AudioDeviceCallback` (`onAudioDevicesAdded` e `onAudioDevicesRemoved`) junto ao `AAUDIO_ERROR_DISCONNECTED` do C++. Ligou o fone Bluetooth/cabo no meio da partida ou música → alterna na hora para o fone; desligou ou tirou o fone → reabre o stream `AAudio` em ~70 ms e passa direto para o **alto-falante do celular**, sem derrubar a conexão USB.
+* **Desconexão explícita:** a sessão só é encerrada quando você toca em **Desconectar** (na notificação/app do celular ou no app do PC) ou desliga/despluga o aplicativo. Como o serviço usa `START_NOT_STICKY`, ele nunca reabre nem reconecta sozinho em segundo plano.
 
 ---
 

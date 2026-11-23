@@ -90,6 +90,7 @@ struct AudioEngineState {
 
     std::atomic<bool> running{false};
     std::atomic<bool> stopRequested{false};
+    std::atomic<bool> routeReopenRequested{false};
     std::atomic<int> stopReason{0};
     std::atomic<int> disconnectEventReason{0};
 
@@ -106,6 +107,7 @@ struct AudioEngineState {
     std::atomic<uint16_t> aaudioBufFrames{512};
     std::atomic<uint16_t> aaudioFlags{0};
     std::atomic<int32_t> baseXruns{0};
+    std::atomic<uint32_t> priorXruns{0};
     bool baselineCaptured = false;
 
     // Lock-free SPSC ring buffer (written by netThread, read by audioDataCallback)
@@ -418,17 +420,25 @@ void audioErrorCallback(
     AAudioStream* /*stream*/,
     void* /*userData*/,
     aaudio_result_t error) {
-    LOGE("AAudio error callback: %s (%d)", AAudio_convertResultToText(error), error);
     if (error == AAUDIO_ERROR_DISCONNECTED) {
-        g_engine.disconnectEventReason.store(1, std::memory_order_release);
-    } else {
-        g_engine.disconnectEventReason.store(3, std::memory_order_release);
+        LOGI("AAudio route changed — scheduling reopen");
+        g_engine.routeReopenRequested.store(true, std::memory_order_release);
+        return;
     }
+    LOGE("AAudio error callback: %s (%d)", AAudio_convertResultToText(error), error);
+    g_engine.disconnectEventReason.store(3, std::memory_order_release);
     g_engine.stopRequested.store(true, std::memory_order_release);
 }
 
 void closeAAudioStream() {
     if (g_engine.aaudioStream != nullptr) {
+        if (g_engine.baselineCaptured) {
+            int32_t curX = AAudioStream_getXRunCount(g_engine.aaudioStream);
+            int32_t baseX = g_engine.baseXruns.load(std::memory_order_relaxed);
+            if (curX > baseX) {
+                g_engine.priorXruns.fetch_add(static_cast<uint32_t>(curX - baseX), std::memory_order_relaxed);
+            }
+        }
         AAudioStream_requestStop(g_engine.aaudioStream);
         AAudioStream_close(g_engine.aaudioStream);
         g_engine.aaudioStream = nullptr;
@@ -605,11 +615,11 @@ void sendStatsPacket(int fd) {
         : static_cast<uint16_t>(std::min<uint64_t>(65535ULL, (static_cast<uint64_t>(minFr) * 10000ULL) / srcRate));
     uint16_t gapMax = g_engine.pktGapMaxMsWindow.exchange(0, std::memory_order_relaxed);
 
-    uint32_t xruns = 0;
+    uint32_t xruns = g_engine.priorXruns.load(std::memory_order_relaxed);
     if (g_engine.aaudioStream != nullptr && g_engine.baselineCaptured) {
         int32_t curX = AAudioStream_getXRunCount(g_engine.aaudioStream);
         int32_t baseX = g_engine.baseXruns.load(std::memory_order_relaxed);
-        if (curX > baseX) xruns = static_cast<uint32_t>(curX - baseX);
+        if (curX > baseX) xruns += static_cast<uint32_t>(curX - baseX);
     }
 
     write_u32_le(buf + 0, g_engine.seqLast.load(std::memory_order_relaxed));
@@ -625,6 +635,41 @@ void sendStatsPacket(int fd) {
     write_u32_le(buf + 28, g_engine.aaudioSampleRate.load(std::memory_order_relaxed));
 
     sendFrameLocked(fd, MSG_STATS, buf, 32);
+}
+
+bool handlePendingRouteReopen(int cfd) {
+    if (!g_engine.routeReopenRequested.exchange(false, std::memory_order_acq_rel)) {
+        return true;
+    }
+    closeAAudioStream();
+    std::this_thread::sleep_for(std::chrono::milliseconds(70));
+    uint32_t sr = g_engine.srcSampleRate.load(std::memory_order_relaxed);
+    if (sr < 8000) sr = 48000;
+    bool reopened = false;
+    for (int attempt = 0; attempt < 5; ++attempt) {
+        if (g_engine.stopRequested.load(std::memory_order_acquire)) return false;
+        if (openAAudioStream(sr)) {
+            reopened = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    if (!reopened) {
+        LOGE("Failed to reopen AAudio stream after route change");
+        g_engine.disconnectEventReason.store(3, std::memory_order_release);
+        g_engine.stopRequested.store(true, std::memory_order_release);
+        return false;
+    }
+    g_engine.resetEpoch.fetch_add(1, std::memory_order_release);
+    char infoBuf[96];
+    std::snprintf(
+        infoBuf,
+        sizeof(infoBuf),
+        "AAudio %uHz · burst %u",
+        g_engine.aaudioSampleRate.load(std::memory_order_relaxed),
+        g_engine.aaudioBurstFrames.load(std::memory_order_relaxed));
+    notifyJavaState(cfd >= 0 ? 2 : 1, infoBuf);
+    return true;
 }
 
 void networkLoop(uint32_t initialSampleRate) {
@@ -644,6 +689,8 @@ void networkLoop(uint32_t initialSampleRate) {
 
     std::vector<uint8_t> payload(65540);
     while (!g_engine.stopRequested.load(std::memory_order_acquire)) {
+        if (!handlePendingRouteReopen(-1)) break;
+
         struct pollfd pfd { g_engine.listenFd, POLLIN, 0 };
         int pr = ::poll(&pfd, 1, 100);
         if (pr < 0) {
@@ -673,6 +720,8 @@ void networkLoop(uint32_t initialSampleRate) {
         bool clientWantedStop = false;
 
         while (!g_engine.stopRequested.load(std::memory_order_acquire)) {
+            if (!handlePendingRouteReopen(cfd)) break;
+
             struct pollfd cpfd { cfd, POLLIN, 0 };
             int cpr = ::poll(&cpfd, 1, 50);
             auto now = Clock::now();
@@ -814,8 +863,10 @@ Java_com_antoniociorcero_phoneaudiobridge_NativeBridge_nativeStart(
     uint32_t sr = sampleRate > 8000 ? static_cast<uint32_t>(sampleRate) : 48000;
     g_engine.listenFd = lfd;
     g_engine.stopRequested.store(false);
+    g_engine.routeReopenRequested.store(false);
     g_engine.stopReason.store(0);
     g_engine.disconnectEventReason.store(0);
+    g_engine.priorXruns.store(0);
     g_engine.writePos.store(0);
     g_engine.resetEpoch.fetch_add(1);
     g_engine.srcSampleRate.store(sr);
@@ -860,6 +911,15 @@ Java_com_antoniociorcero_phoneaudiobridge_NativeBridge_nativeStop(
     if (g_engine.cbObj != nullptr && env != nullptr) {
         env->DeleteGlobalRef(g_engine.cbObj);
         g_engine.cbObj = nullptr;
+    }
+}
+
+JNIEXPORT void JNICALL
+Java_com_antoniociorcero_phoneaudiobridge_NativeBridge_nativeReopenRoute(
+    JNIEnv* /*env*/,
+    jclass /*clazz*/) {
+    if (g_engine.running.load(std::memory_order_acquire)) {
+        g_engine.routeReopenRequested.store(true, std::memory_order_release);
     }
 }
 

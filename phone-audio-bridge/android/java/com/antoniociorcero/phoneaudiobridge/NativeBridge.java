@@ -14,5 +14,6 @@ public final class NativeBridge {
 
     public static native boolean nativeStart(Callback callback, int targetMs, int sampleRate, int gainPct);
     public static native void nativeStop(int reason);
+    public static native void nativeReopenRoute();
     public static native boolean nativeIsRunning();
 }

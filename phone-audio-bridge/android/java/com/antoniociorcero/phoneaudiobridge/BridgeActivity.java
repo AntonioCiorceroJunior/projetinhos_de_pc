@@ -78,7 +78,7 @@ public final class BridgeActivity extends Activity {
         card.addView(statusView);
 
         TextView tip = new TextView(this);
-        tip.setText("Pode desligar a tela — o áudio continua tocando.\nSe desligar o Bluetooth, desconecta na hora sem reconectar sozinho.");
+        tip.setText("Troca automática: com fone conectado sai no fone; sem fone (ou ao desligar o Bluetooth) continua no alto-falante do celular. Só desconecta quando você tocar em Desconectar.");
         tip.setTextColor(Color.rgb(148, 163, 184));
         tip.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
         tip.setPadding(0, 0, 0, dp(20));

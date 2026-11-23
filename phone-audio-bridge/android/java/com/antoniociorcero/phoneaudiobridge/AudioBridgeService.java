@@ -5,10 +5,8 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
-import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
-import android.content.IntentFilter;
 import android.content.pm.ServiceInfo;
 import android.media.AudioDeviceCallback;
 import android.media.AudioDeviceInfo;
@@ -39,10 +37,19 @@ public final class AudioBridgeService extends Service implements NativeBridge.Ca
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private AudioManager audioManager;
     private PowerManager.WakeLock wakeLock;
-    private BroadcastReceiver noisyReceiver;
     private AudioDeviceCallback audioDeviceCallback;
     private boolean receiversRegistered = false;
     private volatile boolean stopping = false;
+    private String lastNativeInfo = "";
+
+    private final Runnable reopenRouteRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (!sRunning || stopping) return;
+            NativeBridge.nativeReopenRoute();
+            refreshRouteUiLabel();
+        }
+    };
 
     public static boolean isServiceRunning() {
         return sRunning;
@@ -151,38 +158,65 @@ public final class AudioBridgeService extends Service implements NativeBridge.Ca
         }
     }
 
+    private static boolean isHeadsetDeviceType(int t) {
+        return t == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
+               t == AudioDeviceInfo.TYPE_BLE_HEADSET ||
+               t == AudioDeviceInfo.TYPE_BLE_SPEAKER ||
+               t == AudioDeviceInfo.TYPE_WIRED_HEADSET ||
+               t == AudioDeviceInfo.TYPE_WIRED_HEADPHONES ||
+               t == AudioDeviceInfo.TYPE_USB_HEADSET;
+    }
+
+    private String describeCurrentOutput() {
+        if (audioManager != null) {
+            try {
+                AudioDeviceInfo[] outs = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS);
+                if (outs != null) {
+                    for (AudioDeviceInfo dev : outs) {
+                        if (isHeadsetDeviceType(dev.getType())) {
+                            return "Fone conectado";
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {}
+        }
+        return "Alto-falante do celular";
+    }
+
+    private void refreshRouteUiLabel() {
+        if (!sRunning || stopping) return;
+        String suffix = lastNativeInfo != null && lastNativeInfo.length() > 0 ? " (" + lastNativeInfo + ")" : "";
+        String txt = "Saída: " + describeCurrentOutput() + suffix;
+        publishState(txt, true);
+        updateNotification(txt);
+    }
+
+    private void scheduleRouteReopen(AudioDeviceInfo[] devices) {
+        if (devices == null || !sRunning || stopping) return;
+        for (AudioDeviceInfo dev : devices) {
+            if (!dev.isSink()) continue;
+            if (isHeadsetDeviceType(dev.getType())) {
+                mainHandler.removeCallbacks(reopenRouteRunnable);
+                mainHandler.postDelayed(reopenRouteRunnable, 160);
+                return;
+            }
+        }
+    }
+
     private void registerDisconnectMonitors() {
         if (receiversRegistered) return;
         receiversRegistered = true;
 
-        noisyReceiver = new BroadcastReceiver() {
-            @Override
-            public void onReceive(Context context, Intent intent) {
-                if (AudioManager.ACTION_AUDIO_BECOMING_NOISY.equals(intent.getAction())) {
-                    stopSessionAndService(1, "Desconectado (Bluetooth/fone removido — sem reconexão automática).");
-                }
-            }
-        };
-        registerReceiver(noisyReceiver, new IntentFilter(AudioManager.ACTION_AUDIO_BECOMING_NOISY));
-
         if (audioManager != null) {
             audioDeviceCallback = new AudioDeviceCallback() {
                 @Override
+                public void onAudioDevicesAdded(AudioDeviceInfo[] addedDevices) {
+                    scheduleRouteReopen(addedDevices);
+                }
+
+                @Override
                 public void onAudioDevicesRemoved(AudioDeviceInfo[] removedDevices) {
-                    if (removedDevices == null || !sRunning || stopping) return;
-                    for (AudioDeviceInfo dev : removedDevices) {
-                        if (!dev.isSink()) continue;
-                        int t = dev.getType();
-                        if (t == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
-                            t == AudioDeviceInfo.TYPE_BLE_HEADSET ||
-                            t == AudioDeviceInfo.TYPE_BLE_SPEAKER ||
-                            t == AudioDeviceInfo.TYPE_WIRED_HEADSET ||
-                            t == AudioDeviceInfo.TYPE_WIRED_HEADPHONES ||
-                            t == AudioDeviceInfo.TYPE_USB_HEADSET) {
-                            stopSessionAndService(1, "Desconectado (fone/Bluetooth removido — sem reconexão automática).");
-                            return;
-                        }
-                    }
+                    scheduleRouteReopen(removedDevices);
                 }
             };
             audioManager.registerAudioDeviceCallback(audioDeviceCallback, mainHandler);
@@ -190,12 +224,9 @@ public final class AudioBridgeService extends Service implements NativeBridge.Ca
     }
 
     private void unregisterDisconnectMonitors() {
+        mainHandler.removeCallbacks(reopenRouteRunnable);
         if (!receiversRegistered) return;
         receiversRegistered = false;
-        if (noisyReceiver != null) {
-            try { unregisterReceiver(noisyReceiver); } catch (Throwable ignored) {}
-            noisyReceiver = null;
-        }
         if (audioManager != null && audioDeviceCallback != null) {
             try { audioManager.unregisterAudioDeviceCallback(audioDeviceCallback); } catch (Throwable ignored) {}
             audioDeviceCallback = null;
@@ -233,12 +264,14 @@ public final class AudioBridgeService extends Service implements NativeBridge.Ca
             @Override
             public void run() {
                 if (stopping) return;
+                lastNativeInfo = info != null ? info : "";
+                String route = describeCurrentOutput();
                 if (state == 2) {
-                    String txt = "Transmitindo áudio do PC (" + info + ")";
+                    String txt = "Transmitindo · " + route + " (" + lastNativeInfo + ")";
                     publishState(txt, true);
                     updateNotification(txt);
                 } else if (state == 1) {
-                    String txt = "Canal USB pronto (" + info + ")";
+                    String txt = "Canal USB pronto · " + route + " (" + lastNativeInfo + ")";
                     publishState(txt, true);
                     updateNotification(txt);
                 }
