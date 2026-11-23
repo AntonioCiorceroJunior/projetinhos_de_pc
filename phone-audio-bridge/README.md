@@ -22,7 +22,7 @@ Muitos PCs de mesa não têm placa Bluetooth embutida (ou têm receptores USB 2.
   * **Modo Cabo USB (~20 ms de buffer):** Reduz drasticamente o *jitter* e o delay usando blocos de **10 ms**, com suporte automático a:
     1. **Ancoragem USB (*USB Tethering*):** Detecta automaticamente a placa de rede USB RNDIS/Apple/Android e ajusta o QR Code para o IP do cabo.
     2. **Túnel ADB (bônus para Android):** Se `adb.exe` estiver disponível no PC e a Depuração USB estiver ativa, cria `adb reverse tcp:8765 tcp:8765` automaticamente (`http://127.0.0.1:8765/?mode=usb`), dispensando Ancoragem USB e passando direto sem bloqueio de firewall.
-* **Player Mobile com Controle Adaptativo de Drift (micro-PLL):** Ajusta suavemente a taxa de reprodução (`0.994x` a `1.006x`) para evitar acúmulo de atraso com o passar das horas, além de *silence gating* (não envia pacotes vazios quando o PC está em silêncio).
+* **Player Mobile com Controle Adaptativo de Drift (micro-PLL) & Desconexão Limpa:** Ajusta suavemente a taxa de reprodução (`0.994x` a `1.006x`) para evitar acúmulo de atraso com o passar das horas, usa *silence gating* quando o PC fica em silêncio e **encerra a sessão automaticamente** se o Bluetooth/áudio do celular for desligado — sem reconectar sozinho depois.
 * **Seleção de dispositivo de saída & medidor de nível ao vivo:** Captura o dispositivo padrão do Windows ou uma saída específica, com barra VU em tempo real e alerta visual de conexão.
 * **Bandeja do Sistema (`^`):** Permite ocultar na área de notificação, alternar entre modos Wi-Fi/USB e marcar **"Iniciar com o Windows"**.
 
@@ -80,9 +80,9 @@ powershell -ExecutionPolicy Bypass -File .\LiberarFirewall.ps1
 
 ## O que acontece se eu desligar e ligar o Bluetooth do celular?
 
-* **A conexão PC ↔ celular (Wi-Fi ou Cabo USB) continua ativa:** o Bluetooth existe apenas entre o **celular e o fone**. Você **não precisa** reiniciar o app no PC nem escanear o QR Code de novo.
-* **Ao desligar o Bluetooth:** o fone desconecta do celular e, por padrão no Android/iOS, o sistema costuma pausar/suspender o áudio da aba (`AudioContext`) para evitar que o som do PC saia de repente no alto-falante do telefone.
-* **Ao religar o Bluetooth e reconectar o fone:** o player detecta a troca de dispositivo/foco e tenta retomar o áudio automaticamente na mesma aba. Se o navegador mantiver o áudio suspenso por restrição do sistema (ex.: tela bloqueada), basta abrir a aba já conectada e tocar no botão **Retomar Áudio** (ou **Desconectar** → **Conectar e Ouvir Áudio**).
+* **Não reconecta sozinho ao PC:** como o computador não tem pareamento Bluetooth direto com o fone, religar o Bluetooth do celular **nunca** vai conectar o fone ao computador por conta própria — mesmo com o PC ligado.
+* **Desconexão automática ao desligar o Bluetooth:** quando você desliga o Bluetooth (ou desconecta o fone) enquanto a aba está aberta, o Android/iOS pausa o áudio da página e o player **encerra na hora a sessão com o PC** (fecha o canal WebSocket e desliga qualquer tentativa de reconexão em segundo plano).
+* **Ao religar o Bluetooth depois:** o fone conecta normalmente apenas ao seu celular. O áudio do PC só volta a tocar se você abrir o player e tocar manualmente em **Conectar e Ouvir Áudio**.
 
 ---
 

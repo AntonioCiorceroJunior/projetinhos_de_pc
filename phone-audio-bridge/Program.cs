@@ -1926,7 +1926,6 @@ body{margin:0;padding:16px;background:var(--bg);color:var(--text);font-family:-a
 .btn-main{width:100%;padding:16px;border-radius:14px;border:none;font-size:16px;font-weight:700;cursor:pointer;background:linear-gradient(135deg,#22c55e,#16a34a);color:#06210f;box-shadow:0 6px 20px rgba(34,197,94,0.28);transition:transform .08s,opacity .15s;}
 .btn-main:active{transform:scale(0.985);}
 .btn-main.stop{background:linear-gradient(135deg,#ef4444,#dc2626);color:#fff;box-shadow:0 6px 20px rgba(239,68,68,0.25);}
-.btn-resume{width:100%;padding:12px;border-radius:12px;border:1px solid rgba(245,158,11,0.5);font-size:14px;font-weight:700;cursor:pointer;background:rgba(245,158,11,0.16);color:#fbbf24;margin-top:10px;display:none;}
 .meter-bg{height:8px;background:#0b0e14;border-radius:999px;overflow:hidden;margin-top:14px;border:1px solid #222b3b;}
 .meter-fill{height:100%;width:0%;background:linear-gradient(90deg,#22c55e,#38bdf8);transition:width 45ms linear;}
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
@@ -1963,7 +1962,6 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
       </div>
     </div>
     <button id=""playBtn"" class=""btn-main"" type=""button"">Conectar e Ouvir Áudio</button>
-    <button id=""resumeBtn"" class=""btn-resume"" type=""button"">Retomar Áudio</button>
     <div class=""meter-bg""><div id=""meterFill"" class=""meter-fill""></div></div>
   </div>
 
@@ -2027,7 +2025,6 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
   var initialMode = params.get('mode') === 'usb' ? 'usb' : 'wifi';
 
   var playBtn = document.getElementById('playBtn');
-  var resumeBtn = document.getElementById('resumeBtn');
   var dot = document.getElementById('dot');
   var statusText = document.getElementById('statusText');
   var deviceText = document.getElementById('deviceText');
@@ -2052,7 +2049,9 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
   var keepAliveAudio = null;
   var wakeLock = null;
   var pingTimer = null;
-  var reconnectTimer = null;
+  var wasAudioRunning = false;
+  var keepAlivePlaying = false;
+  var intentionalPause = false;
 
   var sampleRate = 48000;
   var channels = 2;
@@ -2106,6 +2105,45 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
     return URL.createObjectURL(blob);
   }
 
+  function stopKeepAlive() {
+    intentionalPause = true;
+    keepAlivePlaying = false;
+    try { if (keepAliveAudio) keepAliveAudio.pause(); } catch (e) {}
+  }
+
+  function disconnectSession(state, title, sub) {
+    if (!running && !ws) {
+      setStatus(state, title, sub);
+      return;
+    }
+    running = false;
+    wasAudioRunning = false;
+    if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
+    if (ws) {
+      try {
+        ws.onopen = null;
+        ws.onmessage = null;
+        ws.onclose = null;
+        ws.onerror = null;
+        ws.close();
+      } catch (e) {}
+      ws = null;
+    }
+    stopKeepAlive();
+    if (wakeLock) {
+      try { wakeLock.release(); } catch (e) {}
+      wakeLock = null;
+      wakeBtn.className = 'switch-btn';
+      wakeBtn.textContent = 'Desativado';
+    }
+    playBtn.textContent = 'Conectar e Ouvir Áudio';
+    playBtn.className = 'btn-main';
+    meterFill.style.width = '0%';
+    bufStat.textContent = '-- ms';
+    rttStat.textContent = '-- ms';
+    setStatus(state, title, sub);
+  }
+
   function startKeepAlive() {
     try {
       if (!keepAliveAudio) {
@@ -2113,7 +2151,16 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
         keepAliveAudio.src = buildSilentWavUrl();
         keepAliveAudio.loop = true;
         keepAliveAudio.volume = 0.01;
+        keepAliveAudio.addEventListener('playing', function() {
+          if (running) keepAlivePlaying = true;
+        });
+        keepAliveAudio.addEventListener('pause', function() {
+          if (running && keepAlivePlaying && !intentionalPause) {
+            disconnectSession('', 'Desconectado (fone/Bluetooth removido)', 'Não reconecta sozinho. Toque acima quando quiser ouvir o PC novamente');
+          }
+        });
       }
+      intentionalPause = false;
       var p = keepAliveAudio.play();
       if (p && p.catch) p.catch(function(){});
       if ('mediaSession' in navigator) {
@@ -2123,44 +2170,6 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
         });
       }
     } catch (e) {}
-  }
-
-  function stopKeepAlive() {
-    try { if (keepAliveAudio) keepAliveAudio.pause(); } catch (e) {}
-  }
-
-  function updateAudioStateUi() {
-    if (!ctx || !running) {
-      resumeBtn.style.display = 'none';
-      return;
-    }
-    if (ctx.state === 'running') {
-      resumeBtn.style.display = 'none';
-      if (ws && ws.readyState === 1) {
-        setStatus('live', 'Conectado e recebendo áudio', 'Áudio pronto — toque algo no PC para ouvir');
-      }
-    } else {
-      resumeBtn.style.display = 'block';
-      setStatus('wait', 'Áudio pausado pelo celular', 'Se desligou/religou o Bluetooth, toque em Retomar Áudio');
-    }
-  }
-
-  function tryAutoResumeAudio() {
-    if (!running || !ctx) return;
-    if (ctx.state !== 'running') {
-      try {
-        var rp = ctx.resume();
-        if (rp && rp.then) {
-          rp.then(function() {
-            if (ctx && running) {
-              nextPlayTime = ctx.currentTime + (targetBufferMs / 1000);
-              startKeepAlive();
-              updateAudioStateUi();
-            }
-          }).catch(function(){});
-        }
-      } catch (e) {}
-    }
   }
 
   function ensureAudioContext() {
@@ -2175,20 +2184,26 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
       gainNode.gain.value = parseInt(volSlider.value, 10) / 100;
       gainNode.connect(ctx.destination);
       ctx.onstatechange = function() {
-        updateAudioStateUi();
-        if (running && ctx && ctx.state !== 'running') {
-          setTimeout(tryAutoResumeAudio, 450);
+        if (!ctx) return;
+        if (ctx.state === 'running') {
+          wasAudioRunning = true;
+        } else if (running && wasAudioRunning && (ctx.state === 'suspended' || ctx.state === 'interrupted')) {
+          disconnectSession('', 'Desconectado (Bluetooth/áudio pausado)', 'Não reconecta sozinho. Toque acima quando quiser ouvir o PC novamente');
         }
       };
     }
+    wasAudioRunning = (ctx.state === 'running');
     if (ctx.state !== 'running') {
       try {
         var p = ctx.resume();
-        if (p && p.catch) p.catch(function(){});
+        if (p && p.then) {
+          p.then(function() {
+            if (ctx && ctx.state === 'running') wasAudioRunning = true;
+          }).catch(function(){});
+        }
       } catch (e) {}
     }
     nextPlayTime = ctx.currentTime + (targetBufferMs / 1000);
-    updateAudioStateUi();
   }
 
   function schedulePcmFrame(arrayBuffer) {
@@ -2306,16 +2321,15 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
     };
 
     ws.onclose = function() {
-      if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
-      meterFill.style.width = '0%';
       if (running) {
-        setStatus('wait', 'Reconectando ao PC...', 'Tentando restabelecer conexão');
-        reconnectTimer = setTimeout(connectWs, 1200);
+        disconnectSession('', 'Conexão com o PC encerrada', 'Não reconecta sozinho. Toque acima quando quiser conectar novamente');
       }
     };
 
     ws.onerror = function() {
-      if (running) setStatus('err', 'Falha na conexão', 'Verifique se o app está aberto e o firewall liberado');
+      if (running) {
+        disconnectSession('err', 'Falha na conexão', 'Verifique se o app está aberto e o firewall liberado');
+      }
     };
   }
 
@@ -2330,39 +2344,9 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
       startKeepAlive();
       connectWs();
     } else {
-      running = false;
-      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-      if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
-      if (ws) { try { ws.close(); } catch (e) {} ws = null; }
-      stopKeepAlive();
-      resumeBtn.style.display = 'none';
-      playBtn.textContent = 'Conectar e Ouvir Áudio';
-      playBtn.className = 'btn-main';
-      meterFill.style.width = '0%';
-      setStatus('', 'Desconectado', 'Toque acima para conectar novamente');
+      disconnectSession('', 'Desconectado', 'Toque acima para conectar novamente');
     }
   });
-
-  resumeBtn.addEventListener('click', function() {
-    if (!running) return;
-    ensureAudioContext();
-    startKeepAlive();
-    tryAutoResumeAudio();
-  });
-
-  document.addEventListener('visibilitychange', function() {
-    if (document.visibilityState === 'visible') {
-      tryAutoResumeAudio();
-    }
-  });
-
-  try {
-    if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) {
-      navigator.mediaDevices.addEventListener('devicechange', function() {
-        setTimeout(tryAutoResumeAudio, 350);
-      });
-    }
-  } catch (e) {}
 
   bufSlider.addEventListener('input', function() {
     autoFollowPc = false;
