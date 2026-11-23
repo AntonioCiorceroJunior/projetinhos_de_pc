@@ -1926,7 +1926,7 @@ namespace PhoneAudioBridge
         public AdaptiveState State { get; private set; }
         public int KnownUnsafeFloorMs { get; private set; }
 
-        private int _declinedStabilizeAtMs = -1;
+        private bool _stabilizePromptSuppressed;
         private uint _prevTotalGlitches;
         private bool _hasPrevSample;
         private long _warmupUntilMs;
@@ -1948,7 +1948,6 @@ namespace PhoneAudioBridge
         {
             TargetMs = ClampMs(initialTargetMs);
             KnownUnsafeFloorMs = 0;
-            _declinedStabilizeAtMs = -1;
             _prevTotalGlitches = 0;
             _hasPrevSample = false;
             _recentGlitches.Clear();
@@ -1971,6 +1970,7 @@ namespace PhoneAudioBridge
             }
             else if (State == AdaptiveState.Manual)
             {
+                _stabilizePromptSuppressed = false;
                 _warmupUntilMs = nowMs + 1500;
                 State = AdaptiveState.Warmup;
             }
@@ -1980,7 +1980,6 @@ namespace PhoneAudioBridge
         {
             TargetMs = ClampMs(ms);
             KnownUnsafeFloorMs = 0;
-            _declinedStabilizeAtMs = -1;
             _recentGlitches.Clear();
             _stateStartMs = nowMs;
             _zeroStartMs = nowMs;
@@ -1996,7 +1995,6 @@ namespace PhoneAudioBridge
                 State = AdaptiveState.FloorLocked;
                 return;
             }
-            _declinedStabilizeAtMs = -1;
             KnownUnsafeFloorMs = Math.Max(KnownUnsafeFloorMs, TargetMs);
             int step = TargetMs < 20 ? 2 : 5;
             TargetMs = ClampMs(TargetMs + step);
@@ -2013,7 +2011,7 @@ namespace PhoneAudioBridge
 
         public void DeclineStabilize(long nowMs)
         {
-            _declinedStabilizeAtMs = TargetMs;
+            _stabilizePromptSuppressed = true;
             _recentGlitches.Clear();
             _zeroStartMs = nowMs;
             _stateStartMs = nowMs;
@@ -2130,7 +2128,7 @@ namespace PhoneAudioBridge
             {
                 sumRecent += s.Count;
             }
-            if (sumRecent >= 4 && TargetMs < 120 && TargetMs != _declinedStabilizeAtMs)
+            if (sumRecent >= 4 && TargetMs < 120 && !_stabilizePromptSuppressed)
             {
                 State = AdaptiveState.PromptPending;
                 _stateStartMs = nowMs;
@@ -3041,7 +3039,7 @@ namespace PhoneAudioBridge
                 string title = "Cortes detectados no áudio";
                 string head = string.Format("Cortes frequentes em {0} ms (~{1:0.0} cortes/s)", curMs, gRate);
                 string body = "Deseja que o app estabilize automaticamente aumentando o buffer aos poucos até zerar os cortes?\n\n" +
-                    "(Você pode voltar a diminuir o ms manualmente quando quiser.)";
+                    "(Se clicar em Não, este aviso não aparecerá novamente.)";
                 using (var dlg = new DarkPromptDialog(title, head, body, "Sim, Estabilizar Agora", "Não, manter", Color.FromArgb(251, 191, 36)))
                 {
                     if (dlg.ShowDialog(this) == DialogResult.Yes)
@@ -3630,7 +3628,34 @@ namespace PhoneAudioBridge
                 return false;
             }
 
-            details = "downshift 10->9->8 rollback->9 lock=8; stabilize 10->12->14 lock";
+            // Scenario 3: Declining prompt suppresses it permanently across glitches, manual changes, and reconnects
+            var c3 = new AdaptiveLatencyController(10);
+            int promptCount = 0;
+            c3.OnStabilizePromptRequested = delegate(int ms, double rate) { promptCount++; };
+            c3.Reset(10, 0);
+            c3.ProcessStats(0, 500);
+            c3.ProcessStats(0, 1600);
+            c3.ProcessStats(4, 2500);
+            if (promptCount != 1)
+            {
+                details = string.Format("S3 initial prompt fail: count={0}", promptCount);
+                return false;
+            }
+            c3.DeclineStabilize(3000);
+            c3.ProcessStats(8, 4000);
+            c3.OnManualTargetChanged(8, 5000);
+            c3.ProcessStats(8, 16000);
+            c3.ProcessStats(14, 17000);
+            c3.Reset(10, 20000);
+            c3.ProcessStats(0, 22000);
+            c3.ProcessStats(6, 23000);
+            if (promptCount != 1)
+            {
+                details = string.Format("S3 re-prompted after decline: count={0}", promptCount);
+                return false;
+            }
+
+            details = "downshift 10->9->8 rollback->9 lock=8; stabilize 10->12->14 lock; decline suppress OK";
             return true;
         }
     }

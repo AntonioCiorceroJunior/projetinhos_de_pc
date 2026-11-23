@@ -32,6 +32,7 @@ O motor de controle adaptativo (`AdaptiveLatencyController`) busca o menor atras
 * **Estabilização assistida sob demanda:**
   * Se ocorrerem cortes sustentados (**`≥ 4` eventos em `3,0 s`**), aparece um aviso na tela perguntando se você deseja estabilizar automaticamente.
   * Clicando em **Sim**, o app sobe o buffer em degraus (`+2 ms` abaixo de `20 ms`, `+5 ms` acima de `20 ms`, máximo `120 ms`) a cada `2,5 s` até completar `4,0 s` seguidos com `0` cortes.
+  * Clicando em **Não**, o aviso entende que você está confortável com a configuração atual e **não aparece mais** (a menos que você desative e reative manualmente a opção de ajuste automático).
   * Se você mexer no slider manual (`1–120 ms`), o piso anterior é zerado e o ajuste automático aguarda `10 s` antes de voltar a otimizar.
 
 ---
