@@ -716,8 +716,8 @@ namespace PhoneAudioBridge
                 int accumOffset = 0;
 
                 byte[] rawScratch = new byte[65536];
-                long lastAudioTick = Environment.TickCount;
-                long lastDefaultCheckTick = lastAudioTick;
+                long lastPacketTick = Environment.TickCount;
+                long lastDefaultCheckTick = lastPacketTick;
                 string activeDevId = "";
                 device.GetId(out activeDevId);
 
@@ -749,7 +749,7 @@ namespace PhoneAudioBridge
                     if (nextFrames == 0)
                     {
                         long nowTick = Environment.TickCount;
-                        if (unchecked(nowTick - lastAudioTick) > 260)
+                        if (unchecked(nowTick - lastPacketTick) > 1200)
                         {
                             CurrentLevel = 0f;
                             accumOffset = 0;
@@ -771,7 +771,7 @@ namespace PhoneAudioBridge
                             }
                         }
 
-                        Thread.Sleep(2);
+                        Thread.Sleep(1);
                         continue;
                     }
 
@@ -835,41 +835,29 @@ namespace PhoneAudioBridge
 
                                 float smoothed = CurrentLevel * 0.65f + Math.Min(1f, peak * 1.4f) * 0.35f;
                                 CurrentLevel = smoothed;
+                                lastPacketTick = Environment.TickCount;
 
-                                long nowTick = Environment.TickCount;
-                                if (peak > 0.00018f)
+                                accumOffset += pcmBytes;
+                                int sendOffset = 0;
+                                while (accumOffset - sendOffset >= targetChunkBytes)
                                 {
-                                    lastAudioTick = nowTick;
+                                    byte[] chunk = new byte[targetChunkBytes];
+                                    Buffer.BlockCopy(accum, sendOffset, chunk, 0, targetChunkBytes);
+                                    if (OnPcmPacket != null)
+                                    {
+                                        OnPcmPacket(chunk, outRate);
+                                    }
+                                    sendOffset += targetChunkBytes;
                                 }
 
-                                if (unchecked(nowTick - lastAudioTick) <= 260)
+                                if (sendOffset > 0)
                                 {
-                                    accumOffset += pcmBytes;
-                                    int sendOffset = 0;
-                                    while (accumOffset - sendOffset >= targetChunkBytes)
+                                    int rem = accumOffset - sendOffset;
+                                    if (rem > 0)
                                     {
-                                        byte[] chunk = new byte[targetChunkBytes];
-                                        Buffer.BlockCopy(accum, sendOffset, chunk, 0, targetChunkBytes);
-                                        if (OnPcmPacket != null)
-                                        {
-                                            OnPcmPacket(chunk, outRate);
-                                        }
-                                        sendOffset += targetChunkBytes;
+                                        Buffer.BlockCopy(accum, sendOffset, accum, 0, rem);
                                     }
-
-                                    if (sendOffset > 0)
-                                    {
-                                        int rem = accumOffset - sendOffset;
-                                        if (rem > 0)
-                                        {
-                                            Buffer.BlockCopy(accum, sendOffset, accum, 0, rem);
-                                        }
-                                        accumOffset = rem;
-                                    }
-                                }
-                                else
-                                {
-                                    accumOffset = 0;
+                                    accumOffset = rem;
                                 }
                             }
                         }
@@ -1988,13 +1976,13 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
     <div class=""ctrl"">
       <div class=""ctrl-head"">
         <span>Buffer Alvo (menor = menos atraso)</span>
-        <span id=""bufLbl"" class=""ctrl-val"">55 ms</span>
+        <span id=""bufLbl"" class=""ctrl-val"">90 ms</span>
       </div>
-      <input id=""bufSlider"" type=""range"" min=""15"" max=""150"" step=""5"" value=""55"">
+      <input id=""bufSlider"" type=""range"" min=""25"" max=""220"" step=""5"" value=""90"">
       <div class=""presets"">
-        <button class=""chip"" data-ms=""20"" type=""button"">USB 20ms</button>
-        <button class=""chip"" data-ms=""45"" type=""button"">Rápido 45ms</button>
-        <button class=""chip"" data-ms=""90"" type=""button"">Estável 90ms</button>
+        <button class=""chip"" data-ms=""35"" type=""button"">USB 35ms</button>
+        <button class=""chip"" data-ms=""65"" type=""button"">Normal 65ms</button>
+        <button class=""chip"" data-ms=""110"" type=""button"">Estável 110ms</button>
       </div>
     </div>
     <div class=""ctrl"">
@@ -2015,7 +2003,7 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
   </div>
 
   <div class=""card tip"">
-    Dica: se notar picotes no áudio, aumente um pouco o <b>Buffer Alvo</b> (ex.: 30-45 ms no USB ou 70-90 ms no Wi-Fi). Em músicas/vídeos, deixe a tela bloquear normalmente se o sistema mantiver a guia em segundo plano.
+    Dica: se notar picotes no áudio, aumente um pouco o <b>Buffer Alvo</b> (ex.: 45-65 ms no USB ou 90-120 ms no Wi-Fi). Em músicas/vídeos, deixe a tela bloquear normalmente se o sistema mantiver a guia em segundo plano.
   </div>
 </div>
 
@@ -2056,8 +2044,8 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
   var sampleRate = 48000;
   var channels = 2;
   var nextPlayTime = 0;
-  var targetBufferMs = initialMode === 'usb' ? 20 : 55;
-  var maxBufferMs = initialMode === 'usb' ? 50 : 125;
+  var targetBufferMs = initialMode === 'usb' ? 45 : 90;
+  var maxBufferMs = initialMode === 'usb' ? 140 : 230;
   var autoFollowPc = true;
   var resyncCount = 0;
   var smoothLevel = 0;
@@ -2072,9 +2060,9 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
     }
   }
 
-  function updateBufferUi(ms) {
+  function updateBufferUi(ms, customMax) {
     targetBufferMs = ms;
-    maxBufferMs = Math.max(ms * 2 + 12, ms + 25);
+    maxBufferMs = customMax ? customMax : Math.max(ms * 2 + 40, ms + 80);
     bufSlider.value = String(ms);
     bufLbl.textContent = ms + ' ms';
     for (var i = 0; i < chips.length; i++) {
@@ -2237,9 +2225,9 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
     var maxSec = maxBufferMs / 1000;
     var queued = nextPlayTime - now;
 
-    if (queued < 0.003) {
+    if (queued < 0.008) {
       nextPlayTime = now + targetSec;
-      var fadeSamples = Math.min(frames, Math.round(sampleRate * 0.002));
+      var fadeSamples = Math.min(frames, Math.round(sampleRate * 0.003));
       for (var f = 0; f < fadeSamples; f++) {
         var g = f / fadeSamples;
         ch0[f] *= g;
@@ -2248,22 +2236,17 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
       resyncCount++;
       dropStat.textContent = String(resyncCount);
     } else if (queued > maxSec) {
-      nextPlayTime = now + targetSec;
-      var fade2 = Math.min(frames, Math.round(sampleRate * 0.002));
-      for (var k = 0; k < fade2; k++) {
-        var g2 = k / fade2;
-        ch0[k] *= g2;
-        ch1[k] *= g2;
-      }
       resyncCount++;
       dropStat.textContent = String(resyncCount);
+      bufStat.textContent = Math.max(0, Math.round(queued * 1000)) + ' ms';
+      return;
     }
 
     queued = nextPlayTime - now;
     var err = queued - targetSec;
-    var rate = 1.0 + err * 0.25;
-    if (rate > 1.006) rate = 1.006;
-    if (rate < 0.994) rate = 0.994;
+    var rate = 1.0 + err * 0.35;
+    if (rate > 1.010) rate = 1.010;
+    if (rate < 0.990) rate = 0.990;
 
     var src = ctx.createBufferSource();
     src.buffer = abuf;
@@ -2309,9 +2292,10 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
             if (msg.sampleRate) sampleRate = msg.sampleRate;
             fmtStat.textContent = Math.round(sampleRate / 100) / 10 + 'kHz Estéreo';
             if (msg.device) deviceText.textContent = 'Fonte PC: ' + msg.device;
-            if (msg.mode) applyModeBadge(msg.mode);
+            var tr = msg.transport || msg.mode;
+            if (tr) applyModeBadge(tr);
             if (autoFollowPc && msg.targetBufferMs) {
-              updateBufferUi(msg.targetBufferMs);
+              updateBufferUi(msg.targetBufferMs, msg.maxBufferMs);
             }
           }
         } catch (e) {}
@@ -2421,25 +2405,31 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
         private readonly object _queueLock = new object();
         private readonly Action<WsClientSession> _onDisconnect;
         private volatile bool _closed;
-        private int _maxQueueSize = 4;
+        private int _maxQueueSize = 20;
 
-        public WsClientSession(TcpClient tcp, NetworkStream stream, int maxQueueSize, Action<WsClientSession> onDisconnect)
+        public readonly string LocalIp;
+        public readonly bool IsUsbTransport;
+
+        public WsClientSession(TcpClient tcp, NetworkStream stream, string localIp, bool isUsbTransport, int maxQueueSize, Action<WsClientSession> onDisconnect)
         {
             _tcp = tcp;
             _stream = stream;
+            LocalIp = localIp ?? "";
+            IsUsbTransport = isUsbTransport;
             _maxQueueSize = maxQueueSize;
             _onDisconnect = onDisconnect;
         }
 
         public void SetMaxQueueSize(int maxQueueSize)
         {
-            _maxQueueSize = maxQueueSize < 2 ? 2 : maxQueueSize;
+            _maxQueueSize = maxQueueSize < 4 ? 4 : maxQueueSize;
         }
 
         public void StartLoops()
         {
             var writer = new Thread(WriterLoop);
             writer.IsBackground = true;
+            writer.Priority = ThreadPriority.AboveNormal;
             writer.Name = "WS-Writer";
             writer.Start();
 
@@ -2663,6 +2653,8 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
         private readonly int _port;
         private readonly List<WsClientSession> _clients = new List<WsClientSession>();
         private readonly object _clientsLock = new object();
+        private readonly HashSet<string> _usbLocalIps = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private readonly object _usbIpLock = new object();
         private readonly byte[] _htmlBytes;
         private TcpListener _listener;
         private Thread _acceptThread;
@@ -2672,8 +2664,8 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
         public volatile string Mode = "wifi";
         public volatile int SampleRate = 48000;
         public volatile int ChunkMs = 20;
-        public volatile int TargetBufferMs = 55;
-        public volatile int MaxBufferMs = 125;
+        public volatile int TargetBufferMs = 90;
+        public volatile int MaxBufferMs = 230;
         public volatile string DeviceName = "Padrão do Windows";
         public volatile bool UsbDetected;
         public volatile bool AdbActive;
@@ -2702,10 +2694,77 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
             }
         }
 
+        public string ConnectedTransportSummary
+        {
+            get
+            {
+                bool hasUsb = false;
+                bool hasWifi = false;
+                lock (_clientsLock)
+                {
+                    for (int i = 0; i < _clients.Count; i++)
+                    {
+                        if (_clients[i].IsUsbTransport) hasUsb = true;
+                        else hasWifi = true;
+                    }
+                }
+                if (hasUsb && hasWifi) return "both";
+                if (hasUsb) return "usb";
+                if (hasWifi) return "wifi";
+                return "";
+            }
+        }
+
         public AudioWebServer(int port)
         {
             _port = port;
             _htmlBytes = Encoding.UTF8.GetBytes(MobilePlayerHtml.BuildPage());
+        }
+
+        public void UpdateUsbIps(HashSet<string> ips)
+        {
+            lock (_usbIpLock)
+            {
+                _usbLocalIps.Clear();
+                if (ips != null)
+                {
+                    foreach (string ip in ips)
+                    {
+                        if (!string.IsNullOrEmpty(ip))
+                        {
+                            _usbLocalIps.Add(ip);
+                        }
+                    }
+                }
+            }
+        }
+
+        private bool IsUsbLocalEndpoint(string localIp)
+        {
+            if (string.IsNullOrEmpty(localIp)) return false;
+            if (string.Equals(localIp, "127.0.0.1", StringComparison.Ordinal)) return true;
+            lock (_usbIpLock)
+            {
+                return _usbLocalIps.Contains(localIp);
+            }
+        }
+
+        private static void GetClientTransportProfile(bool isUsbTransport, out string transport, out int targetMs, out int maxMs, out int qLimit)
+        {
+            if (isUsbTransport)
+            {
+                transport = "usb";
+                targetMs = 45;
+                maxMs = 140;
+                qLimit = 16;
+            }
+            else
+            {
+                transport = "wifi";
+                targetMs = 90;
+                maxMs = 230;
+                qLimit = 20;
+            }
         }
 
         public void Start()
@@ -2725,30 +2784,31 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
             bool isUsb = (mode == BridgeMode.Usb);
             Mode = isUsb ? "usb" : "wifi";
             SampleRate = sampleRate > 0 ? sampleRate : 48000;
-            ChunkMs = isUsb ? 10 : 20;
-            TargetBufferMs = isUsb ? 20 : 55;
-            MaxBufferMs = isUsb ? 50 : 125;
+            ChunkMs = isUsb ? 15 : 20;
+            TargetBufferMs = isUsb ? 45 : 90;
+            MaxBufferMs = isUsb ? 140 : 230;
             DeviceName = string.IsNullOrEmpty(deviceName) ? "Padrão do Windows" : deviceName;
 
-            int qLimit = isUsb ? 3 : 4;
-            string cfgJson = BuildConfigJson();
             lock (_clientsLock)
             {
                 for (int i = 0; i < _clients.Count; i++)
                 {
-                    _clients[i].SetMaxQueueSize(qLimit);
-                    _clients[i].EnqueueText(cfgJson);
+                    string tr;
+                    int tMs;
+                    int mMs;
+                    int qLim;
+                    GetClientTransportProfile(_clients[i].IsUsbTransport, out tr, out tMs, out mMs, out qLim);
+                    _clients[i].SetMaxQueueSize(qLim);
+                    _clients[i].EnqueueText(BuildConfigJson(_clients[i].IsUsbTransport));
                 }
             }
         }
 
         public void BroadcastPcm(byte[] pcm16Stereo)
         {
-            int count;
             lock (_clientsLock)
             {
-                count = _clients.Count;
-                if (count == 0) return;
+                if (_clients.Count == 0) return;
 
                 uint seq = ++_seqCounter;
                 uint tick = unchecked((uint)Environment.TickCount);
@@ -2770,22 +2830,39 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
             }
         }
 
-        private string BuildConfigJson()
+        private string BuildConfigJson(bool isUsbTransport)
         {
+            string tr;
+            int targetMs;
+            int maxMs;
+            int qLim;
+            GetClientTransportProfile(isUsbTransport, out tr, out targetMs, out maxMs, out qLim);
             return string.Format(
-                "{{\"type\":\"config\",\"sampleRate\":{0},\"channels\":2,\"bits\":16,\"mode\":\"{1}\",\"chunkMs\":{2},\"targetBufferMs\":{3},\"maxBufferMs\":{4},\"device\":\"{5}\"}}",
+                "{{\"type\":\"config\",\"sampleRate\":{0},\"channels\":2,\"bits\":16,\"mode\":\"{1}\",\"transport\":\"{2}\",\"chunkMs\":{3},\"targetBufferMs\":{4},\"maxBufferMs\":{5},\"device\":\"{6}\"}}",
                 SampleRate,
                 Mode,
+                tr,
                 ChunkMs,
-                TargetBufferMs,
-                MaxBufferMs,
+                targetMs,
+                maxMs,
                 EscapeJson(DeviceName));
         }
 
         private string BuildInfoJson()
         {
+            var usbListSb = new StringBuilder();
+            lock (_usbIpLock)
+            {
+                bool first = true;
+                foreach (string ip in _usbLocalIps)
+                {
+                    if (!first) usbListSb.Append(",");
+                    usbListSb.Append("\"").Append(EscapeJson(ip)).Append("\"");
+                    first = false;
+                }
+            }
             return string.Format(
-                "{{\"mode\":\"{0}\",\"sampleRate\":{1},\"channels\":2,\"bits\":16,\"chunkMs\":{2},\"targetBufferMs\":{3},\"maxBufferMs\":{4},\"device\":\"{5}\",\"clients\":{6},\"usbDetected\":{7},\"adbActive\":{8}}}",
+                "{{\"mode\":\"{0}\",\"sampleRate\":{1},\"channels\":2,\"bits\":16,\"chunkMs\":{2},\"targetBufferMs\":{3},\"maxBufferMs\":{4},\"device\":\"{5}\",\"clients\":{6},\"clientTransports\":\"{7}\",\"usbDetected\":{8},\"adbActive\":{9},\"usbIps\":[{10}]}}",
                 Mode,
                 SampleRate,
                 ChunkMs,
@@ -2793,8 +2870,10 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
                 MaxBufferMs,
                 EscapeJson(DeviceName),
                 ClientCount,
+                ConnectedTransportSummary,
                 UsbDetected ? "true" : "false",
-                AdbActive ? "true" : "false");
+                AdbActive ? "true" : "false",
+                usbListSb.ToString());
         }
 
         private static string EscapeJson(string s)
@@ -2832,6 +2911,7 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
             try
             {
                 client.NoDelay = true;
+                client.SendBufferSize = 65536;
                 client.ReceiveTimeout = 5000;
                 client.SendTimeout = 5000;
                 NetworkStream stream = client.GetStream();
@@ -2880,14 +2960,24 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
                     client.ReceiveTimeout = 0;
                     client.SendTimeout = 3000;
 
-                    int qLimit = Mode == "usb" ? 3 : 4;
-                    var session = new WsClientSession(client, stream, qLimit, OnSessionClosed);
+                    string localIp = "";
+                    IPEndPoint lep = client.Client.LocalEndPoint as IPEndPoint;
+                    if (lep != null) localIp = lep.Address.ToString();
+                    bool isUsbClient = IsUsbLocalEndpoint(localIp);
+
+                    string tr;
+                    int tMs;
+                    int mMs;
+                    int qLimit;
+                    GetClientTransportProfile(isUsbClient, out tr, out tMs, out mMs, out qLimit);
+
+                    var session = new WsClientSession(client, stream, localIp, isUsbClient, qLimit, OnSessionClosed);
                     lock (_clientsLock)
                     {
                         _clients.Add(session);
                     }
                     session.StartLoops();
-                    session.EnqueueText(BuildConfigJson());
+                    session.EnqueueText(BuildConfigJson(isUsbClient));
                     keepOpen = true;
                     return;
                 }
@@ -3143,7 +3233,7 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
 
             _btnWifi = new Button
             {
-                Text = "Wi-Fi / Rede Local\r\nSem cabos (~55 ms)",
+                Text = "Wi-Fi / Rede Local\r\nSem cabos (~90 ms)",
                 Location = new Point(lx, 100),
                 Size = new Size(198, 52),
                 FlatStyle = FlatStyle.Flat,
@@ -3155,7 +3245,7 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
 
             _btnUsb = new Button
             {
-                Text = "Cabo USB (Menor Delay)\r\nSuper responsivo (~20 ms)",
+                Text = "Cabo USB (Menor Delay)\r\nMais estável (~45 ms)",
                 Location = new Point(lx + 210, 100),
                 Size = new Size(198, 52),
                 FlatStyle = FlatStyle.Flat,
@@ -3386,7 +3476,7 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
             if (_miModeWifi != null) _miModeWifi.Checked = !isUsb;
             if (_miModeUsb != null) _miModeUsb.Checked = isUsb;
 
-            _capture.SetModeChunkMs(isUsb ? 10 : 20);
+            _capture.SetModeChunkMs(isUsb ? 15 : 20);
             _server.UpdateProfile(mode, _capture.CurrentSampleRate, _capture.ActiveDeviceName);
 
             SelectPreferredNetworkForMode();
@@ -3439,21 +3529,37 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
             {
                 NetEndpointOption prev = _cmbNetwork.SelectedItem as NetEndpointOption;
                 string prevIp = prev != null ? prev.IpAddress : "";
+                bool prevWasUsb = (prev != null && (prev.IsUsb || prev.IsAdb));
 
                 var eps = NetworkHelper.DiscoverEndpoints(_adbActive);
+                var usbIps = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 bool anyUsb = _adbActive;
                 _cmbNetwork.Items.Clear();
                 int foundIdx = -1;
                 for (int i = 0; i < eps.Count; i++)
                 {
                     _cmbNetwork.Items.Add(eps[i]);
-                    if (eps[i].IsUsb) anyUsb = true;
+                    if (eps[i].IsUsb || eps[i].IsAdb)
+                    {
+                        anyUsb = true;
+                        usbIps.Add(eps[i].IpAddress);
+                    }
                     if (!string.IsNullOrEmpty(prevIp) && string.Equals(eps[i].IpAddress, prevIp, StringComparison.Ordinal))
                     {
                         foundIdx = i;
                     }
                 }
                 _server.UsbDetected = anyUsb;
+                _server.UpdateUsbIps(usbIps);
+
+                if (_mode == BridgeMode.Usb && anyUsb && !prevWasUsb)
+                {
+                    foundIdx = -1;
+                }
+                else if (_mode == BridgeMode.Wifi && prevWasUsb)
+                {
+                    foundIdx = -1;
+                }
 
                 if (foundIdx >= 0)
                 {
@@ -3584,11 +3690,11 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
 
             if (_mode == BridgeMode.Usb)
             {
-                _lblQrHint.Text = "Perfil Cabo USB: pacotes de 10 ms · buffer inicial 20 ms.\r\nSe o link usar 192.168.x.x, libere o Firewall abaixo.";
+                _lblQrHint.Text = "Perfil Cabo USB: blocos de 15 ms · buffer 45 ms.\r\nSe o link usar 192.168.x.x, libere o Firewall abaixo.";
             }
             else
             {
-                _lblQrHint.Text = "Perfil Wi-Fi: pacotes de 20 ms · buffer inicial 55 ms.\r\nEscaneie com a câmera do celular ou digite o link acima.";
+                _lblQrHint.Text = "Perfil Wi-Fi: blocos de 20 ms · buffer 90 ms.\r\nEscaneie com a câmera do celular ou digite o link acima.";
             }
         }
 
@@ -3597,9 +3703,25 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
             int clients = _server.ClientCount;
             if (clients > 0)
             {
-                _lblStatusBadge.Text = string.Format("Transmitindo · {0} conectado(s)", clients);
-                _lblStatusBadge.BackColor = Color.FromArgb(18, 52, 34);
-                _lblStatusBadge.ForeColor = Color.FromArgb(74, 222, 128);
+                string tr = _server.ConnectedTransportSummary;
+                if (tr == "usb")
+                {
+                    _lblStatusBadge.Text = string.Format("Transmitindo (USB) · {0}", clients);
+                    _lblStatusBadge.BackColor = Color.FromArgb(18, 52, 34);
+                    _lblStatusBadge.ForeColor = Color.FromArgb(74, 222, 128);
+                }
+                else if (tr == "wifi" && _mode == BridgeMode.Usb)
+                {
+                    _lblStatusBadge.Text = string.Format("Wi-Fi ativo · use QR USB", clients);
+                    _lblStatusBadge.BackColor = Color.FromArgb(66, 46, 16);
+                    _lblStatusBadge.ForeColor = Color.FromArgb(251, 191, 36);
+                }
+                else
+                {
+                    _lblStatusBadge.Text = string.Format("Transmitindo (Wi-Fi) · {0}", clients);
+                    _lblStatusBadge.BackColor = Color.FromArgb(18, 52, 34);
+                    _lblStatusBadge.ForeColor = Color.FromArgb(74, 222, 128);
+                }
             }
             else if (!string.IsNullOrEmpty(_capture.LastError))
             {
@@ -3900,7 +4022,7 @@ input[type=range]{width:100%;accent-color:#38bdf8;height:6px;}
 
                 // Test GET /api/info
                 string infoResp = HttpGetText("127.0.0.1", port, "/api/info");
-                bool infoValid = infoResp.Contains("200 OK") && infoResp.Contains("\"mode\":\"usb\"") && infoResp.Contains("\"targetBufferMs\":20");
+                bool infoValid = infoResp.Contains("200 OK") && infoResp.Contains("\"mode\":\"usb\"") && infoResp.Contains("\"chunkMs\":15") && infoResp.Contains("\"targetBufferMs\":45");
 
                 // Test WebSocket upgrade + config + ping->pong
                 bool wsValid = TestWebSocketHandshakeAndPing("127.0.0.1", port, out serverDetails);

@@ -18,11 +18,11 @@ Muitos PCs de mesa não têm placa Bluetooth embutida (ou têm receptores USB 2.
 
 * **QR Code gerado na hora (100% offline/nativo):** Escaneie com a câmera do celular para abrir o player direto no navegador (Chrome/Safari), sem instalar app no celular.
 * **Dois modos otimizados de transmissão:**
-  * **Modo Wi-Fi / Rede Local (~55 ms de buffer):** Prático e sem fios, usando pacotes de 20 ms via WebSocket.
-  * **Modo Cabo USB (~20 ms de buffer):** Reduz drasticamente o *jitter* e o delay usando blocos de **10 ms**, com suporte automático a:
-    1. **Ancoragem USB (*USB Tethering*):** Detecta automaticamente a placa de rede USB RNDIS/Apple/Android e ajusta o QR Code para o IP do cabo.
+  * **Modo Wi-Fi / Rede Local (~90 ms de buffer):** Prático e sem fios, usando pacotes de 20 ms via WebSocket.
+  * **Modo Cabo USB (~45 ms de buffer):** Reduz drasticamente o *jitter* e o delay usando blocos de **15 ms**, com suporte automático a:
+    1. **Ancoragem USB (*USB Tethering*):** Detecta automaticamente a placa de rede USB RNDIS/Apple/Android e troca o QR Code para o IP do cabo assim que a ancoragem é ativada.
     2. **Túnel ADB (bônus para Android):** Se `adb.exe` estiver disponível no PC e a Depuração USB estiver ativa, cria `adb reverse tcp:8765 tcp:8765` automaticamente (`http://127.0.0.1:8765/?mode=usb`), dispensando Ancoragem USB e passando direto sem bloqueio de firewall.
-* **Player Mobile com Controle Adaptativo de Drift (micro-PLL) & Desconexão Limpa:** Ajusta suavemente a taxa de reprodução (`0.994x` a `1.006x`) para evitar acúmulo de atraso com o passar das horas, usa *silence gating* quando o PC fica em silêncio e **encerra a sessão automaticamente** se o Bluetooth/áudio do celular for desligado — sem reconectar sozinho depois.
+* **Player Mobile com Controle Adaptativo de Drift (micro-PLL) & Desconexão Limpa:** Ajusta suavemente a taxa de reprodução (`0.990x` a `1.010x`) para evitar acúmulo de atraso e evitar estalos/cortes, e **encerra a sessão automaticamente** se o Bluetooth/áudio do celular for desligado — sem reconectar sozinho depois.
 * **Seleção de dispositivo de saída & medidor de nível ao vivo:** Captura o dispositivo padrão do Windows ou uma saída específica, com barra VU em tempo real e alerta visual de conexão.
 * **Bandeja do Sistema (`^`):** Permite ocultar na área de notificação, alternar entre modos Wi-Fi/USB e marcar **"Iniciar com o Windows"**.
 
@@ -69,10 +69,10 @@ powershell -ExecutionPolicy Bypass -File .\LiberarFirewall.ps1
 ### 4. Como usar o Modo Cabo USB (Menor Delay)
 1. No app do Windows, clique em **Cabo USB (Menor Delay)**.
 2. Plugue o cabo USB do celular no computador:
-   - **Android:** vá em **Configurações → Rede e internet / Ponto de acesso → Ancoragem USB** (*USB Tethering*) e ative. O app detecta o IP USB automaticamente e atualiza o QR Code.
+   - **Android:** vá em **Configurações → Rede e internet / Ponto de acesso → Ancoragem USB** (*USB Tethering*) e ative. Assim que a placa USB subir no Windows, o app muda automaticamente o QR Code para o IP do cabo (`[Cabo USB] ...`). **Escaneie ou abra esse novo link USB** no navegador (se continuar na aba antiga do Wi-Fi, o áudio ainda estará passando pelo Wi-Fi!).
    - **iPhone:** vá em **Ajustes → Acesso Pessoal**, ative e toque em **Confiar** no aviso de computador.
    - *(Opcional Android com ADB)*: com **Depuração USB** ativa e `adb.exe` instalado, clique em **Tentar Túnel ADB** e acesse `http://127.0.0.1:8765/?mode=usb` no Chrome do celular.
-3. Conecte seu fone Bluetooth no celular, escaneie o QR Code e toque em **Conectar e Ouvir Áudio**.
+3. Conecte seu fone Bluetooth no celular, escaneie o QR Code atualizado e toque em **Conectar e Ouvir Áudio**.
 
 > **Dica sobre o som no PC:** Como a captura usa *WASAPI Loopback*, o app copia o áudio que está tocando na saída selecionada no Windows. Se você não quiser ouvir o som simultaneamente em outra caixa/headset do PC, selecione como saída no Windows um monitor sem alto-falantes ligados (ou reduza o volume físico da caixa) e deixe o volume do Windows normal — ou ajuste o dispositivo desejado no combo **Fonte de Áudio**.
 
