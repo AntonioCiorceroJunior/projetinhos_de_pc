@@ -35,7 +35,7 @@ Todos os scripts seguem quatro princípios:
 | :--- | :--- | :--- | :--- |
 | **ATK DPI & Polling Rate Quick Switch** | [`atk-dpi-quick-switch/`](./atk-dpi-quick-switch/README.md) | Troca instantânea de DPI (800 / 1600 / 3200) e Polling Rate (1K ↔ 8K) via atalhos globais com OSD flutuante e redução automática para 1000 Hz no LoL para evitar travamentos no motor do jogo. | C# (.NET 4.x), Win32 HID (`hid.dll` / `setupapi.dll`), `RegisterHotKey` + `Raw Input`, WinForms + GDI+, PowerShell |
 | **Rose & LTK AutoSync** | [`rose-ltk-autosync/`](./rose-ltk-autosync/README.md) | Garante que Rose, LTK Manager, Pengu Loader e Porofessor/Overwolf não fiquem abertos fora do LoL; ao abrir o cliente, abre o Porofessor e pergunta se você quer ativar Rose/LTK naquela sessão. | PowerShell, VBScript (`WScript.Shell`), Windows Task Scheduler, Registro (IFEO), WMI/CIM |
-| **Peripheral Battery Tray** | [`peripheral-battery-tray/`](./peripheral-battery-tray/README.md) | Mostra a bateria em tempo real com **1 ícone separado por periférico** na bandeja oculta (`^`) do Windows (ATK X1 Ultimate 2.0, Corsair HS80 RGB e Bluetooth automático). | C# (.NET 4.x), Win32 HID Overlapped I/O, protocolo Corsair Bragi, SetupAPI Bluetooth (`DEVPKEY_Bluetooth_Battery`), WinForms + GDI+ |
+| **Peripheral Battery Tray** | [`peripheral-battery-tray/`](./peripheral-battery-tray/README.md) | Mostra a bateria em tempo real com **1 ícone separado por periférico** fixado ao lado do `^` (ocultando dispositivos desligados por padrão) para ATK X1 Ultimate 2.0, Corsair HS80 RGB e Bluetooth automático. | C# (.NET 4.x), Win32 HID Overlapped I/O, protocolo Corsair Bragi, SetupAPI Bluetooth (`DEVPKEY_Bluetooth_Battery`), WinForms + GDI+ |
 
 ---
 

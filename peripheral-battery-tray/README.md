@@ -1,23 +1,25 @@
 # Peripheral Battery Tray (`PeripheralBatteryTray`)
 
-Utilitário nativo e super leve para Windows que cria **1 ícone separado por periférico** na bandeja oculta (`^`, perto do relógio), mostrando a porcentagem exata da bateria em tempo real sem depender de suítes pesadas ou telas abertas.
+Utilitário nativo e super leve para Windows que cria **1 ícone separado por periférico** fixado diretamente na barra de tarefas (ao lado da setinha `^`), mostrando a porcentagem exata da bateria em tempo real sem depender de suítes pesadas ou telas abertas. Periféricos desligados/desconectados ficam ocultos automaticamente por padrão e aparecem assim que forem ligados.
 
 ---
 
 ## O que ele mostra e faz
 
-* **1 ícone independente por dispositivo:**
+* **1 ícone independente por dispositivo (aparece somente quando conectado/ligado por padrão):**
   - **Mouse ATK X1 Ultimate 2.0** (`VID 0x373B` — cabo USB e dongle 8K sem fio)
   - **Headset Corsair HS80 RGB Wireless** (`VID 0x1B1C` — dongle sem fio `0x0A6B` e cabo USB `0x0A69`)
   - **Qualquer periférico Bluetooth compatível** conectado ao Windows (detecção automática)
+* **Fixação automática na barra de tarefas (Windows 11):** Por padrão, o app promove automaticamente seus próprios ícones (`IsPromoted = 1` em `NotifyIconSettings`) para que fiquem visíveis ao lado do `^` sem precisar configurar manualmente — mesmo quando um novo aparelho é ligado depois.
 * **Ícone dinâmico em 32×32 px (GDI+):** Exibe o número da bateria em destaque, um mini símbolo identificando o tipo (mouse / headset / Bluetooth), barra proporcional e cores por nível:
   - 🟢 **Verde** (≥ 50%) · 🟡 **Amarelo** (21–49%) · 🔴 **Vermelho** (≤ 20%) · 🔵 **Ciano + raio** (Carregando) · ⚪ **Cinza `Zz`/`--`** (Em repouso / Desligado)
 * **Tooltip detalhado ao passar o mouse:** Mostra nome, porcentagem, modo de conexão e voltagem da célula (no ATK).
 * **Alerta de bateria baixa:** Dispara uma notificação balão única quando algum dispositivo cai para `<= 15%` fora do carregador.
 * **Menu no clique direito (dedicado em cada ícone):**
-  - Resumo atualizado de todos os periféricos monitorados
+  - Resumo atualizado de todos os periféricos monitorados *(inclusive os desligados no momento)*
   - **Atualizar agora** *(ou duplo clique no ícone)*
-  - **Ocultar periféricos desligados** *(salvo no Registro em `HKCU\Software\PeripheralBatteryTray`)*
+  - **Ocultar periféricos desligados** *(ativado por padrão; salvo em `HKCU\Software\PeripheralBatteryTray`)*
+  - **Fixar ícones na barra de tarefas** *(ativado por padrão; alterna visibilidade ao lado do `^` vs dentro da setinha `^`)*
   - **Iniciar com o Windows** *(salvo em `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`)*
   - **Sair** *(remove todos os ícones sem deixar fantasmas e encerra de forma limpa)*
 
@@ -66,11 +68,11 @@ Antes mesmo de abrir os ícones, você pode testar a leitura instantânea gravan
 Get-Content .\probe_test.txt
 ```
 
-### 3. Executar na bandeja (`^`)
+### 3. Executar na barra de tarefas
 ```powershell
 Start-Process .\PeripheralBatteryTray.exe
 ```
-Os ícones aparecerão na setinha **`^`** perto do relógio (no Windows 11, novos ícones começam ocultos na setinha `^` por padrão — caso queira algum fixo na barra, basta arrastá-lo para fora da setinha).
+Por padrão, somente dispositivos ligados/conectados exibem ícone, e eles já são fixados automaticamente ao lado da setinha **`^`**. Se preferir recolher algum para dentro da setinha `^` ou exibir aparelhos desligados, basta usar o menu de clique direito (**Fixar ícones na barra de tarefas** / **Ocultar periféricos desligados**).
 
 Para iniciar automaticamente com o Windows, clique com o botão direito em qualquer um dos ícones e marque **"Iniciar com o Windows"**.
 

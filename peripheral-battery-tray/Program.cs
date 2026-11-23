@@ -1092,6 +1092,7 @@ namespace PeripheralBatteryTray
         private const string AppName = "PeripheralBatteryTray";
         private const string RegRunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
         private const string RegSettingsKey = @"Software\PeripheralBatteryTray";
+        private const string RegNotifyIconKey = @"Control Panel\NotifyIconSettings";
         private const int PollIntervalMs = 10000;
 
         private readonly AtkMouseReader _atkReader = new AtkMouseReader();
@@ -1102,7 +1103,8 @@ namespace PeripheralBatteryTray
         private readonly System.Threading.Timer _pollTimer;
 
         private int _pollingFlag = 0;
-        private bool _hideOffline = false;
+        private bool _hideOffline = true;
+        private bool _pinToTaskbar = true;
         private bool _disposed = false;
 
         public TrayAppContext()
@@ -1116,6 +1118,7 @@ namespace PeripheralBatteryTray
             }
 
             _hideOffline = LoadHideOfflineSetting();
+            _pinToTaskbar = LoadPinToTaskbarSetting();
 
             SystemEvents.PowerModeChanged += OnPowerModeChanged;
 
@@ -1208,6 +1211,7 @@ namespace PeripheralBatteryTray
                 _latestReadings.AddRange(readings);
 
                 HashSet<string> activeIds = new HashSet<string>();
+                bool createdNewIcon = false;
 
                 for (int i = 0; i < readings.Count; i++)
                 {
@@ -1229,6 +1233,7 @@ namespace PeripheralBatteryTray
                         entry.NotifyIcon.ContextMenuStrip = entry.ContextMenu;
                         entry.NotifyIcon.DoubleClick += delegate { TriggerPollAsync(); };
                         _entries[r.Id] = entry;
+                        createdNewIcon = true;
                     }
 
                     string iconKey = string.Format("{0}|{1}|{2}|{3}", r.State, r.Percent, r.IsCharging, r.IsFullyCharged);
@@ -1291,6 +1296,11 @@ namespace PeripheralBatteryTray
                     string id = toRemove[i];
                     _entries[id].Dispose();
                     _entries.Remove(id);
+                }
+
+                if (createdNewIcon && _pinToTaskbar)
+                {
+                    SchedulePromoteOwnTrayIcons();
                 }
             }
             catch (Exception ex)
@@ -1360,6 +1370,12 @@ namespace PeripheralBatteryTray
             hideOfflineItem.Click += OnToggleHideOffline;
             menu.Items.Add(hideOfflineItem);
 
+            ToolStripMenuItem pinTaskbarItem = new ToolStripMenuItem("Fixar ícones na barra de tarefas");
+            pinTaskbarItem.CheckOnClick = true;
+            pinTaskbarItem.Checked = _pinToTaskbar;
+            pinTaskbarItem.Click += OnTogglePinToTaskbar;
+            menu.Items.Add(pinTaskbarItem);
+
             ToolStripMenuItem startupItem = new ToolStripMenuItem("Iniciar com o Windows");
             startupItem.CheckOnClick = true;
             startupItem.Checked = IsStartupEnabled();
@@ -1383,6 +1399,18 @@ namespace PeripheralBatteryTray
             _hideOffline = item.Checked;
             SaveHideOfflineSetting(_hideOffline);
             ApplyReadings(new List<BatteryReading>(_latestReadings));
+        }
+
+        private void OnTogglePinToTaskbar(object sender, EventArgs e)
+        {
+            ToolStripMenuItem item = sender as ToolStripMenuItem;
+            if (item == null)
+            {
+                return;
+            }
+            _pinToTaskbar = item.Checked;
+            SavePinToTaskbarSetting(_pinToTaskbar);
+            SetOwnTrayIconsPromoted(_pinToTaskbar);
         }
 
         private void OnToggleStartup(object sender, EventArgs e)
@@ -1415,7 +1443,7 @@ namespace PeripheralBatteryTray
             catch
             {
             }
-            return false;
+            return true;
         }
 
         private static void SaveHideOfflineSetting(bool hideOffline)
@@ -1432,6 +1460,118 @@ namespace PeripheralBatteryTray
             }
             catch
             {
+            }
+        }
+
+        private static bool LoadPinToTaskbarSetting()
+        {
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(RegSettingsKey, false))
+                {
+                    if (key != null)
+                    {
+                        object val = key.GetValue("PinToTaskbar");
+                        if (val != null)
+                        {
+                            return Convert.ToInt32(val) != 0;
+                        }
+                    }
+                }
+            }
+            catch
+            {
+            }
+            return true;
+        }
+
+        private static void SavePinToTaskbarSetting(bool pinToTaskbar)
+        {
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.CreateSubKey(RegSettingsKey))
+                {
+                    if (key != null)
+                    {
+                        key.SetValue("PinToTaskbar", pinToTaskbar ? 1 : 0, RegistryValueKind.DWord);
+                    }
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        private void SchedulePromoteOwnTrayIcons()
+        {
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                try
+                {
+                    Thread.Sleep(700);
+                    if (_disposed || !_pinToTaskbar)
+                    {
+                        return;
+                    }
+                    SetOwnTrayIconsPromoted(true);
+
+                    Thread.Sleep(1500);
+                    if (_disposed || !_pinToTaskbar)
+                    {
+                        return;
+                    }
+                    SetOwnTrayIconsPromoted(true);
+                }
+                catch (Exception ex)
+                {
+                    Program.LogError("SchedulePromoteOwnTrayIcons", ex);
+                }
+            });
+        }
+
+        private static void SetOwnTrayIconsPromoted(bool promoted)
+        {
+            try
+            {
+                string exePath = Process.GetCurrentProcess().MainModule.FileName;
+                int desired = promoted ? 1 : 0;
+
+                using (RegistryKey parent = Registry.CurrentUser.OpenSubKey(RegNotifyIconKey, false))
+                {
+                    if (parent == null)
+                    {
+                        return;
+                    }
+
+                    string[] subNames = parent.GetSubKeyNames();
+                    for (int i = 0; i < subNames.Length; i++)
+                    {
+                        using (RegistryKey sub = parent.OpenSubKey(subNames[i], true))
+                        {
+                            if (sub == null)
+                            {
+                                continue;
+                            }
+
+                            object pathObj = sub.GetValue("ExecutablePath");
+                            string pathStr = pathObj as string;
+                            if (string.IsNullOrEmpty(pathStr) || !string.Equals(pathStr, exePath, StringComparison.OrdinalIgnoreCase))
+                            {
+                                continue;
+                            }
+
+                            object currentPromoted = sub.GetValue("IsPromoted");
+                            if (currentPromoted == null || Convert.ToInt32(currentPromoted) != desired)
+                            {
+                                sub.SetValue("IsPromoted", desired, RegistryValueKind.DWord);
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Program.LogError("SetOwnTrayIconsPromoted", ex);
             }
         }
 
